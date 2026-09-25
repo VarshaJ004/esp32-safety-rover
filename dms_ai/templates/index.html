@@ -1,0 +1,674 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Autonomous Vehicle DMS & Hazard HUD</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link
+    href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap"
+    rel="stylesheet">
+  <style>
+    :root {
+      /* Enterprise Dark Canvas */
+      --bg-base: #0a0d14;
+      --bg-surface: #10141e;
+      --bg-card: #151b27;
+      --bg-card-hover: #19202f;
+      --bg-well: #0c1018;
+
+      /* Structural Separators */
+      --border-subtle: #1e2638;
+      --border-mid: #2c364e;
+      --border-active: #3b82f6;
+
+      /* Standard Engineering Accents */
+      --brand-blue: #3b82f6;
+      --brand-blue-soft: rgba(59, 130, 246, 0.12);
+
+      /* Semantic Status Signals */
+      --state-safe: #10b981;
+      --state-safe-bg: rgba(16, 185, 129, 0.1);
+      --state-warn: #f59e0b;
+      --state-warn-bg: rgba(245, 158, 11, 0.1);
+      --state-danger: #ef4444;
+      --state-danger-bg: rgba(239, 68, 68, 0.12);
+
+      /* Typography Scales */
+      --text-high: #f8fafc;
+      --text-mid: #94a3b8;
+      --text-low: #64748b;
+    }
+
+    * {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+    }
+
+    body {
+      background: var(--bg-base);
+      color: var(--text-high);
+      font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      padding: 24px;
+      -webkit-font-smoothing: antialiased;
+    }
+
+    .app-shell {
+      width: 100%;
+      max-width: 1280px;
+      display: flex;
+      flex-direction: column;
+      gap: 18px;
+    }
+
+    /* Enterprise Navigation Header */
+    .topbar {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      background: var(--bg-surface);
+      border: 1px solid var(--border-subtle);
+      border-radius: 10px;
+      padding: 14px 20px;
+      box-shadow: 0 1px 3px rgba(0, 0, 0, 0.25);
+    }
+
+    .brand-meta {
+      display: flex;
+      align-items: center;
+      gap: 14px;
+    }
+
+    .live-dot {
+      width: 9px;
+      height: 9px;
+      border-radius: 50%;
+      background: var(--state-safe);
+      box-shadow: 0 0 0 3px rgba(16, 185, 129, 0.2);
+    }
+
+    .platform-title {
+      font-size: 0.92rem;
+      font-weight: 600;
+      letter-spacing: -0.01em;
+      color: var(--text-high);
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+
+    .platform-tag {
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 0.72rem;
+      color: var(--text-low);
+      background: var(--bg-well);
+      border: 1px solid var(--border-subtle);
+      padding: 2px 7px;
+      border-radius: 4px;
+    }
+
+    .status-badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 6px 14px;
+      border-radius: 6px;
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 0.75rem;
+      font-weight: 600;
+      letter-spacing: 0.04em;
+      background: var(--state-safe-bg);
+      color: var(--state-safe);
+      border: 1px solid rgba(16, 185, 129, 0.25);
+      transition: all 0.2s ease;
+    }
+
+    .status-badge.critical {
+      background: var(--state-danger-bg);
+      color: var(--state-danger);
+      border-color: rgba(239, 68, 68, 0.35);
+      animation: alertBlink 1.4s infinite;
+    }
+
+    .status-badge.warning {
+      background: var(--state-warn-bg);
+      color: var(--state-warn);
+      border-color: rgba(245, 158, 11, 0.35);
+    }
+
+    @keyframes alertBlink {
+
+      0%,
+      100% {
+        opacity: 1;
+      }
+
+      50% {
+        opacity: 0.65;
+      }
+    }
+
+    /* Core Application Grid */
+    .cockpit-grid {
+      display: grid;
+      grid-template-columns: 1.8fr 1.2fr;
+      gap: 18px;
+      align-items: stretch;
+    }
+
+    @media (max-width: 980px) {
+      .cockpit-grid {
+        grid-template-columns: 1fr;
+      }
+    }
+
+    /* Primary Feed Viewport */
+    .viewport-panel {
+      background: var(--bg-surface);
+      border: 1px solid var(--border-subtle);
+      border-radius: 10px;
+      overflow: hidden;
+      display: flex;
+      flex-direction: column;
+    }
+
+    .viewport-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      padding: 12px 18px;
+      background: var(--bg-surface);
+      border-bottom: 1px solid var(--border-subtle);
+      font-size: 0.75rem;
+      font-weight: 500;
+      color: var(--text-mid);
+    }
+
+    .stream-meta {
+      font-family: 'JetBrains Mono', monospace;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+
+    .stream-meta span {
+      color: var(--brand-blue);
+      font-weight: 600;
+    }
+
+    .fps-pill {
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 0.72rem;
+      color: var(--text-mid);
+      background: var(--bg-card);
+      border: 1px solid var(--border-subtle);
+      padding: 3px 8px;
+      border-radius: 4px;
+    }
+
+    .video-viewport {
+      position: relative;
+      width: 100%;
+      height: 100%;
+      min-height: 460px;
+      background: #000;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+
+    .video-viewport img {
+      width: 100%;
+      height: 100%;
+      object-fit: contain;
+      display: block;
+    }
+
+    /* Telemetry Deck */
+    .telemetry-deck {
+      display: flex;
+      flex-direction: column;
+      gap: 14px;
+    }
+
+    .section-card {
+      background: var(--bg-surface);
+      border: 1px solid var(--border-subtle);
+      border-radius: 10px;
+      padding: 18px;
+      display: flex;
+      flex-direction: column;
+      gap: 16px;
+    }
+
+    /* Cognitive Load / Fatigue Bar */
+    .gauge-container {
+      background: var(--bg-card);
+      border: 1px solid var(--border-subtle);
+      border-radius: 8px;
+      padding: 14px 16px;
+    }
+
+    .gauge-top {
+      display: flex;
+      justify-content: space-between;
+      align-items: baseline;
+      margin-bottom: 8px;
+    }
+
+    .gauge-title {
+      font-size: 0.72rem;
+      font-weight: 600;
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+      color: var(--text-mid);
+    }
+
+    .gauge-val {
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 1.15rem;
+      font-weight: 600;
+      color: var(--text-high);
+    }
+
+    .gauge-track {
+      width: 100%;
+      height: 6px;
+      background: var(--border-subtle);
+      border-radius: 3px;
+      overflow: hidden;
+    }
+
+    .gauge-fill {
+      height: 100%;
+      width: 5%;
+      border-radius: 3px;
+      background: var(--state-safe);
+      transition: width 0.25s ease, background-color 0.25s ease;
+    }
+
+    /* Telemetry Matrix Grid */
+    .telemetry-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 10px;
+    }
+
+    .grid-card {
+      background: var(--bg-card);
+      border: 1px solid var(--border-subtle);
+      border-radius: 8px;
+      padding: 12px 14px;
+      display: flex;
+      flex-direction: column;
+      justify-content: space-between;
+      min-height: 72px;
+      transition: border-color 0.15s ease;
+    }
+
+    .grid-card:hover {
+      border-color: var(--border-mid);
+    }
+
+    .card-label {
+      font-size: 0.68rem;
+      font-weight: 600;
+      letter-spacing: 0.05em;
+      color: var(--text-low);
+      text-transform: uppercase;
+    }
+
+    .metric-value {
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 1.25rem;
+      font-weight: 600;
+      color: var(--text-high);
+      margin-top: 4px;
+    }
+
+    .metric-value.warn {
+      color: var(--state-warn);
+    }
+
+    .metric-value.crit {
+      color: var(--state-danger);
+    }
+
+    /* Tactical Action Controls */
+    .controls-deck {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 10px;
+    }
+
+    .system-btn {
+      padding: 12px 16px;
+      border-radius: 6px;
+      font-size: 0.78rem;
+      font-weight: 600;
+      letter-spacing: 0.02em;
+      border: 1px solid transparent;
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 8px;
+      transition: background-color 0.15s ease, border-color 0.15s ease;
+      outline: none;
+    }
+
+    .btn-halt {
+      background: var(--state-danger-bg);
+      color: #fca5a5;
+      border-color: rgba(239, 68, 68, 0.3);
+    }
+
+    .btn-halt:hover {
+      background: rgba(239, 68, 68, 0.2);
+      border-color: var(--state-danger);
+    }
+
+    .btn-halt:active {
+      background: var(--state-danger);
+      color: #fff;
+    }
+
+    .btn-arm {
+      background: var(--bg-card);
+      color: var(--text-high);
+      border-color: var(--border-mid);
+    }
+
+    .btn-arm:hover {
+      background: var(--bg-card-hover);
+      border-color: var(--brand-blue);
+      color: #fff;
+    }
+
+    .btn-arm:active {
+      background: var(--border-subtle);
+    }
+
+    /* Event Stream Log Card */
+    .log-terminal {
+      background: var(--bg-card);
+      border: 1px solid var(--border-subtle);
+      border-radius: 8px;
+      padding: 14px;
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+    }
+
+    .terminal-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      padding-bottom: 6px;
+      border-bottom: 1px solid var(--border-subtle);
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 0.68rem;
+      font-weight: 600;
+      color: var(--text-low);
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+    }
+
+    .log-stream {
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+      max-height: 130px;
+      overflow-y: auto;
+    }
+
+    .log-stream::-webkit-scrollbar {
+      width: 4px;
+    }
+
+    .log-stream::-webkit-scrollbar-track {
+      background: transparent;
+    }
+
+    .log-stream::-webkit-scrollbar-thumb {
+      background: var(--border-subtle);
+      border-radius: 4px;
+    }
+
+    .log-entry {
+      display: flex;
+      gap: 8px;
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 0.72rem;
+      line-height: 1.4;
+    }
+
+    .log-ts {
+      color: var(--text-low);
+      flex-shrink: 0;
+    }
+
+    .log-text.success {
+      color: var(--state-safe);
+    }
+
+    .log-text.warning {
+      color: var(--state-warn);
+    }
+
+    .log-text.danger {
+      color: var(--state-danger);
+      font-weight: 600;
+    }
+  </style>
+</head>
+
+<body>
+  <div class="app-shell">
+
+    <!-- Primary Control Header -->
+    <header class="topbar">
+      <div class="brand-meta">
+        <div class="live-dot" id="liveDot"></div>
+        <div class="platform-title">
+          Autonomous Vehicle Telematics & DMS
+        </div>
+        <span class="platform-tag">ISO-26262 COMPLIANT</span>
+      </div>
+      <div class="status-badge" id="driverStateBadge">
+        SAFE & ATTENTIVE
+      </div>
+    </header>
+
+    <!-- Operational Viewports & Metrics Grid -->
+    <main class="cockpit-grid">
+
+      <!-- Real-Time Camera Pipeline -->
+      <section class="viewport-panel">
+        <div class="viewport-header">
+          <div class="stream-meta">
+            STREAM 01 // <span>SYNCHRONIZED DMS + ROAD SENSING</span>
+          </div>
+          <div class="fps-pill" id="fpsBadge">FPS: --</div>
+        </div>
+        <div class="video-viewport">
+          <img class="video-stream" src="/video_feed" alt="Video Feed Offline"
+            onerror="this.alt='Connecting to camera stream...';">
+        </div>
+      </section>
+
+      <!-- Right Column: Analytics & Override Control -->
+      <section class="telemetry-deck">
+        <div class="section-card">
+
+          <!-- Fatigue Assessment Gauge -->
+          <div class="gauge-container">
+            <div class="gauge-top">
+              <span class="gauge-title">Fatigue Index</span>
+              <span class="gauge-val" id="fatigueVal">5%</span>
+            </div>
+            <div class="gauge-track">
+              <div class="gauge-fill" id="fatigueBar"></div>
+            </div>
+          </div>
+
+          <!-- Real-Time Metrics Matrix -->
+          <div class="telemetry-grid">
+            <div class="grid-card">
+              <span class="card-label">Eye State</span>
+              <span class="metric-value" id="eyeStatus">OPEN</span>
+            </div>
+            <div class="grid-card">
+              <span class="card-label">Yawn Trigger</span>
+              <span class="metric-value" id="yawnStatus">NO</span>
+            </div>
+            <div class="grid-card">
+              <span class="card-label">Road Assessment</span>
+              <span class="metric-value" id="roadCondition">CLEAR</span>
+            </div>
+            <div class="grid-card">
+              <span class="card-label">Potholes Detected</span>
+              <span class="metric-value" id="potholeCount">0</span>
+            </div>
+            <div class="grid-card">
+              <span class="card-label">Blink Frequency</span>
+              <span class="metric-value" id="blinkCount">0</span>
+            </div>
+            <div class="grid-card">
+              <span class="card-label">Critical Alarms</span>
+              <span class="metric-value" id="alarmCount">0</span>
+            </div>
+          </div>
+
+          <!-- Actuation Controls -->
+          <div class="controls-deck">
+            <button class="system-btn btn-halt" onclick="sendEspCommand('STOP')">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2">
+                <circle cx="12" cy="12" r="10" />
+                <rect x="9" y="9" width="6" height="6" />
+              </svg>
+              Emergency Halt
+            </button>
+            <button class="system-btn btn-arm" onclick="sendEspCommand('S')">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2">
+                <polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2" />
+              </svg>
+              Arm / Restore
+            </button>
+          </div>
+
+          <!-- Diagnostic Journal -->
+          <div class="log-terminal">
+            <div class="terminal-header">
+              <span>Telemetry Journal</span>
+              <span>LIVE TELEMETRY</span>
+            </div>
+            <div class="log-stream" id="logsList">
+              <div class="log-entry">
+                <span class="log-ts">[00:00:00]</span>
+                <span class="log-text success">WebSocket connected to local engine</span>
+              </div>
+            </div>
+          </div>
+
+        </div>
+      </section>
+
+    </main>
+  </div>
+
+  <script>
+    const ESP32_URL = "http://192.168.4.1";
+
+    function sendEspCommand(val) {
+      fetch(`${ESP32_URL}/cmd?val=${val}`, { mode: 'no-cors' }).catch(() => { });
+    }
+
+    const wsProto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+    const wsUrl = `${wsProto}//${window.location.host}/ws`;
+    let ws;
+
+    function initWebSocket() {
+      ws = new WebSocket(wsUrl);
+
+      ws.onmessage = (event) => {
+        try {
+          const data = JSON.parse(event.data);
+          const t = data.telemetry;
+
+          // Badges and FPS
+          document.getElementById('fpsBadge').innerText = `FPS: ${t.fps}`;
+
+          // Core Metrics
+          const eyeElem = document.getElementById('eyeStatus');
+          eyeElem.innerText = t.eye_status;
+          eyeElem.className = 'metric-value ' + (t.eye_status === 'CLOSED' ? 'crit' : '');
+
+          const yawnElem = document.getElementById('yawnStatus');
+          yawnElem.innerText = t.yawning;
+          yawnElem.className = 'metric-value ' + (t.yawning === 'YES' ? 'warn' : '');
+
+          const roadElem = document.getElementById('roadCondition');
+          roadElem.innerText = t.road_condition;
+          roadElem.className = 'metric-value ' + (t.pothole_detected ? 'warn' : '');
+
+          document.getElementById('potholeCount').innerText = t.pothole_count;
+          document.getElementById('blinkCount').innerText = t.eye_blinks;
+          document.getElementById('alarmCount').innerText = t.alarms_triggered;
+
+          // Fatigue Meter
+          const fatigue = t.drowsiness_level;
+          const bar = document.getElementById('fatigueBar');
+          const fatigueVal = document.getElementById('fatigueVal');
+          fatigueVal.innerText = `${fatigue}%`;
+          bar.style.width = `${fatigue}%`;
+
+          if (fatigue >= 80) {
+            bar.style.backgroundColor = 'var(--state-danger)';
+            fatigueVal.style.color = 'var(--state-danger)';
+          } else if (fatigue >= 40) {
+            bar.style.backgroundColor = 'var(--state-warn)';
+            fatigueVal.style.color = 'var(--state-warn)';
+          } else {
+            bar.style.backgroundColor = 'var(--state-safe)';
+            fatigueVal.style.color = 'var(--text-high)';
+          }
+
+          // System Status Badge
+          const badge = document.getElementById('driverStateBadge');
+          badge.innerText = t.driver_condition;
+          if (t.driver_condition.includes('CRITICAL')) {
+            badge.className = 'status-badge critical';
+          } else if (t.driver_condition.includes('WARNING')) {
+            badge.className = 'status-badge warning';
+          } else {
+            badge.className = 'status-badge';
+          }
+
+          // Real-time Event Journal
+          if (data.logs) {
+            const list = document.getElementById('logsList');
+            list.innerHTML = data.logs.map(l =>
+              `<div class="log-entry"><span class="log-ts">[${l.time}]</span><span class="log-text ${l.type}">${l.msg}</span></div>`
+            ).join('');
+          }
+        } catch (e) { }
+      };
+
+      ws.onclose = () => {
+        setTimeout(initWebSocket, 2000);
+      };
+    }
+
+    initWebSocket();
+  </script>
+</body>
+
+</html>
