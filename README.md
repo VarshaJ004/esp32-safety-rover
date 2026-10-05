@@ -64,27 +64,50 @@ esp32 rover/
 
 ---
 
-## 🚀 Quick Start Guide
+## 🚀 Quick Start Guide (Common Network Integration)
+
+All devices (**ESP32 Controller**, **Laptop running DMS AI**, and **Mobile Phone Cockpit**) connect to a **common Wi-Fi network** (home/lab router or smartphone mobile hotspot).
 
 ### 1. Flash the ESP32 Firmware
 1. Open Arduino IDE and load `firmware/esp32_rover/esp32_rover.ino`.
-2. Connect your ESP32 board via USB.
-3. Select board `ESP32 Dev Module` and click **Upload**.
-4. The ESP32 will broadcast a Wi-Fi Hotspot:
-   - **SSID**: `ESP32-Safety-Car`
-   - **Password**: `12345678`
-   - **IP Address**: `http://192.168.4.1`
+2. Configure your Wi-Fi credentials near the top of `esp32_rover.ino`:
+   ```cpp
+   const char *ssid        = "Your-WiFi-Name";      // e.g. "X200 fe" or Home Router
+   const char *password    = "Your-WiFi-Password";
+   ```
+   *(Note: ESP32 uses 2.4 GHz. If using a mobile phone hotspot, ensure "Maximize Compatibility" / 2.4 GHz is ON).*
+3. Connect your ESP32 via USB and click **Upload**.
+4. Open the Serial Monitor (115200 baud). The ESP32 will connect to your network and print:
+   - **Assigned DHCP IP**: `http://192.168.x.x` (or `http://10.x.x.x`)
+   - **mDNS Hostname**: `http://esp32-rover.local`
+   *(Zero-Lockout Fallback: If the common network is unavailable, it automatically starts fallback AP hotspot `ESP32-Safety-Car` at `http://192.168.4.1`).*
 
-### 2. Launch the Mobile App
-1. Install **Expo Go** on your iOS or Android device.
-2. In your terminal, run:
+### 2. Launch the AI Driver Monitoring System (Laptop)
+1. Connect your laptop to the **same Wi-Fi network**.
+2. Launch the AI vision system:
+   ```bash
+   cd dms_ai
+   run_dms.bat
+   ```
+   *(or run `python drowsiness_detector.py`)*
+3. On startup, the console automatically prints:
+   - **Target ESP32 URL**: `http://esp32-rover.local` (with LAN UDP broadcast discovery)
+   - **Laptop DMS Web URL**: `http://localhost:8000`
+   - **Common Network Endpoint**: `http://<laptop-ip>:8000` (enter this in the Mobile App)
+4. Open `http://localhost:8000` to view the dual-camera HUD and AI telematics.
+
+### 3. Launch the Mobile Cockpit (Physical Phone or Browser)
+1. Ensure your smartphone is connected to the **same common Wi-Fi network**.
+2. Start the Expo server on your laptop:
    ```bash
    cd mobile_app
    npm start
    ```
-3. Connect your phone's Wi-Fi to `ESP32-Safety-Car`.
-4. Scan the QR code in the terminal to open the dedicated rover cockpit in **Expo Go**.
-5. Alternatively, run `npm run web` to preview the controller in your desktop browser!
+3. Open **Expo Go** on your phone and scan the QR code (or run `npm run web` to preview in browser).
+4. Tap **System Config (gear icon)**:
+   - **Rover Gateway**: `http://esp32-rover.local` (or tap the **Common Wi-Fi (mDNS)** preset).
+   - **DMS Host**: `http://<laptop-ip>:8000` (your laptop's Wi-Fi IP from Step 2).
+   - Tap **Ping Diagnostic** and **Test Laptop DMS Connection** to verify both links!
 
 ---
 

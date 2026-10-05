@@ -689,8 +689,14 @@
         </div>
       </div>
 
-      <div class="status-badge" id="driverStateBadge">
-        SYSTEM CONNECTING...
+      <div style="display: flex; align-items: center; gap: 10px;">
+        <div id="roverNetworkBadge" style="font-family: 'JetBrains Mono', monospace; font-size: 0.75rem; color: var(--text-mid); background: var(--glass-surface-2); padding: 7px 14px; border-radius: 12px; border: 1px solid var(--glass-border); display: flex; align-items: center; gap: 8px; cursor: pointer; transition: all 0.2s;" title="Click to view or edit ESP32 Rover IP on common network" onclick="promptRoverUrl()">
+          <span id="roverStatusLed" style="width: 8px; height: 8px; border-radius: 50%; background: var(--state-warn); display: inline-block;"></span>
+          <span id="roverUrlText">ROVER: INITIALIZING...</span>
+        </div>
+        <div class="status-badge" id="driverStateBadge">
+          SYSTEM CONNECTING...
+        </div>
       </div>
     </header>
 
@@ -854,14 +860,55 @@
   </div>
 
   <script>
-    const ESP32_URL = "http://192.168.4.1";
+    let currentRoverUrl = "http://esp32-rover.local";
 
     const wsProto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
     const wsUrl = `${wsProto}//${window.location.host}/ws`;
     let ws;
 
+    async function fetchNetworkInfo() {
+      try {
+        const res = await fetch('/api/network_info');
+        if (res.ok) {
+          const data = await res.json();
+          if (data.esp32_host_url) currentRoverUrl = data.esp32_host_url;
+          updateRoverBadge(data.esp32_connected, currentRoverUrl);
+        }
+      } catch(e) {}
+    }
+
+    function updateRoverBadge(connected, url) {
+      const el = document.getElementById('roverUrlText');
+      const led = document.getElementById('roverStatusLed');
+      if (el) el.innerText = 'ROVER: ' + url.replace(/^https?:\/\//, '');
+      if (led) {
+        led.style.background = connected ? 'var(--state-safe)' : 'var(--state-warn)';
+        led.style.boxShadow = connected ? '0 0 10px var(--state-safe-glow)' : 'none';
+      }
+    }
+
+    async function promptRoverUrl() {
+      const input = prompt("ESP32 Rover URL on Common Wi-Fi (e.g. http://esp32-rover.local or your Rover's LAN IP):", currentRoverUrl);
+      if (input && input.trim() !== "") {
+        try {
+          const res = await fetch('/api/set_esp32_url', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ url: input.trim() })
+          });
+          if (res.ok) {
+            const d = await res.json();
+            currentRoverUrl = d.esp32_host_url;
+            updateRoverBadge(true, currentRoverUrl);
+          }
+        } catch(e) {}
+      }
+    }
+
+    fetchNetworkInfo();
+
     /* =========================================================
-       CONTROL ACTIONS (RESTORE / HALT) - UNCHANGED
+       CONTROL ACTIONS (RESTORE / HALT) - COMMON NETWORK SAFE
        ========================================================= */
 
     function triggerArm() {
@@ -873,7 +920,9 @@
         ws.send(JSON.stringify({ action: "arm" }));
       }
 
-      fetch(`${ESP32_URL}/cmd?val=ARM`, { mode: 'no-cors' }).catch(() => { });
+      if (currentRoverUrl) {
+        fetch(`${currentRoverUrl}/cmd?val=ARM`, { mode: 'no-cors' }).catch(() => { });
+      }
     }
 
     function triggerHalt() {
@@ -881,7 +930,9 @@
       if (ws && ws.readyState === WebSocket.OPEN) {
         ws.send(JSON.stringify({ action: "halt" }));
       }
-      fetch(`${ESP32_URL}/cmd?val=STOP`, { mode: 'no-cors' }).catch(() => { });
+      if (currentRoverUrl) {
+        fetch(`${currentRoverUrl}/cmd?val=STOP`, { mode: 'no-cors' }).catch(() => { });
+      }
     }
 
     /* =========================================================
@@ -903,6 +954,11 @@
         try {
           const data = JSON.parse(event.data);
           const t = data.telemetry;
+
+          if (t.esp32_url) currentRoverUrl = t.esp32_url;
+          if (t.esp32_connected !== undefined) {
+            updateRoverBadge(t.esp32_connected, currentRoverUrl);
+          }
 
           // FPS
           const fpsBadge = document.getElementById('fpsBadge');

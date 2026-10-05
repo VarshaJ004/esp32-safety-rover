@@ -5,6 +5,7 @@ os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
 import asyncio
 from contextlib import asynccontextmanager
 import json
+import socket
 import threading
 import time
 import urllib.request
@@ -33,15 +34,77 @@ try:
 except ImportError:
     HAS_WINSOUND = False
 
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+CONFIG_FILE = os.path.join(SCRIPT_DIR, "config.json")
+
+def get_laptop_ip():
+    """Detects primary LAN IPv4 address of this laptop."""
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.settimeout(0.2)
+        s.connect(("8.8.8.8", 80))
+        ip = s.getsockname()[0]
+        s.close()
+        return ip
+    except Exception:
+        return "127.0.0.1"
+
+def discover_rover_on_lan(timeout=1.2):
+    """Sends UDP broadcast on port 4210 to discover ESP32 Rover IP on common network."""
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+        sock.settimeout(timeout)
+        sock.sendto(b"DISCOVER_ROVER", ("<broadcast>", 4210))
+        data, addr = sock.recvfrom(1024)
+        msg = data.decode("utf-8", errors="ignore")
+        sock.close()
+        if "ROVER_HERE:" in msg:
+            url = msg.split("ROVER_HERE:")[1].strip()
+            if not url.startswith("http://") and not url.startswith("https://"):
+                url = "http://" + url
+            return url
+    except Exception:
+        pass
+    return None
+
+def load_esp32_url():
+    """Loads ESP32 URL from environment variables, config.json, or mDNS default."""
+    if os.environ.get("ESP32_HOST_URL"):
+        return os.environ.get("ESP32_HOST_URL").strip().rstrip('/')
+    if os.environ.get("ESP32_URL"):
+        return os.environ.get("ESP32_URL").strip().rstrip('/')
+    if os.path.exists(CONFIG_FILE):
+        try:
+            with open(CONFIG_FILE, "r") as f:
+                cfg = json.load(f)
+                if cfg.get("esp32_url"):
+                    return cfg["esp32_url"].strip().rstrip('/')
+        except Exception:
+            pass
+    # Default to standard mDNS hostname on common network
+    return "http://esp32-rover.local"
+
+def save_esp32_url(new_url: str):
+    global ESP32_HOST_URL
+    new_url = new_url.strip().rstrip('/')
+    if not new_url.startswith("http://") and not new_url.startswith("https://"):
+        new_url = "http://" + new_url
+    ESP32_HOST_URL = new_url
+    try:
+        with open(CONFIG_FILE, "w") as f:
+            json.dump({"esp32_url": new_url}, f, indent=2)
+    except Exception:
+        pass
+    return new_url
+
 # ======================= CONFIGURATION =======================
-ESP32_HOST_URL = "http://192.168.4.1"
+ESP32_HOST_URL = load_esp32_url()
 SERIAL_PORT = None
 SERIAL_BAUD = 115200
 
 DRIVER_CAM_INDEX = 1   # Set to 0 or 1 depending on your webcam index
-ROAD_SOURCE = None      # Road cam index (set to None if testing with single cam)
-
-SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+ROAD_SOURCE = 0     # Road cam index (set to None if testing with single cam)
 FACE_MODEL_PATH = os.path.join(SCRIPT_DIR, "face_landmarker.task")
 FACE_MODEL_URL = "https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task"
 
@@ -90,6 +153,8 @@ telemetry = {
     "alarms_triggered": 0,
     "alcohol_level": 0,
     "alcohol_detected": False,
+    "esp32_connected": False,
+    "esp32_url": ESP32_HOST_URL,
     "fps": 30.0,
     "timestamp": ""
 }
@@ -221,6 +286,8 @@ def esp32_telemetry_worker():
                     esp_state = data.get("state", "IDLE")
 
                     with lock:
+                        telemetry["esp32_connected"] = True
+                        telemetry["esp32_url"] = ESP32_HOST_URL
                         telemetry["alcohol_level"] = alc_val
                         telemetry["alcohol_detected"] = alc_detected
                         alcohol_lock_active = alc_detected
@@ -241,7 +308,8 @@ def esp32_telemetry_worker():
                         last_logged_alcohol_state = False
                         add_log("Alcohol cleared. Ready to Re-Arm.", "success")
         except Exception:
-            pass
+            with lock:
+                telemetry["esp32_connected"] = bool(serial_conn and serial_conn.is_open)
         time.sleep(0.15)
 
 def audio_alert_worker():
@@ -601,6 +669,39 @@ async def api_halt():
     add_log("Emergency Halt Triggered manually via Dashboard", "danger")
     return JSONResponse(content={"status": "HALTED"})
 
+@app.get("/api/network_info")
+async def api_network_info():
+    laptop_ip = get_laptop_ip()
+    with lock:
+        conn = telemetry.get("esp32_connected", False)
+    return JSONResponse(content={
+        "laptop_ip": laptop_ip,
+        "dms_url": f"http://{laptop_ip}:8000",
+        "esp32_host_url": ESP32_HOST_URL,
+        "esp32_connected": conn,
+        "has_serial": bool(serial_conn and serial_conn.is_open),
+        "serial_port": getattr(serial_conn, 'port', None) if serial_conn else None
+    })
+
+@app.post("/api/set_esp32_url")
+async def api_set_esp32_url(request: Request):
+    data = await request.json()
+    url = data.get("url", "")
+    if url:
+        saved = save_esp32_url(url)
+        add_log(f"Rover URL updated to: {saved}", "success")
+        return JSONResponse(content={"status": "OK", "esp32_host_url": saved})
+    return JSONResponse(status_code=400, content={"error": "URL required"})
+
+@app.post("/api/discover_rover")
+async def api_discover_rover():
+    found_url = discover_rover_on_lan(timeout=1.5)
+    if found_url:
+        saved = save_esp32_url(found_url)
+        add_log(f"Auto-discovered Rover at {saved}", "success")
+        return JSONResponse(content={"status": "FOUND", "esp32_host_url": saved})
+    return JSONResponse(content={"status": "NOT_FOUND", "current_url": ESP32_HOST_URL})
+
 async def generate_mjpeg():
     global latest_frame, system_running
     try:
@@ -652,4 +753,14 @@ async def websocket_endpoint(websocket: WebSocket):
 
 if __name__ == "__main__":
     import uvicorn
+    local_ip = get_laptop_ip()
+    print("\n" + "=" * 68)
+    print("  \U0001F697 AI DRIVER MONITORING & SAFETY ROVER INTERLOCK SYSTEM")
+    print("=" * 68)
+    print(f"  \U0001F4E1 Target ESP32 Rover URL : {ESP32_HOST_URL}")
+    print(f"  \U0001F4BB Laptop DMS Web Server  : http://localhost:8000")
+    print(f"  \U0001F310 Common Network URL     : http://{local_ip}:8000")
+    print(f"  \U0001F4F1 Mobile App Config      : In Mobile App Settings, set DMS Host to:")
+    print(f"                             http://{local_ip}:8000")
+    print("=" * 68 + "\n")
     uvicorn.run(app, host="0.0.0.0", port=8000, log_level="warning")

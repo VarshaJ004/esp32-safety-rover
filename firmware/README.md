@@ -54,12 +54,13 @@ This directory contains the upgraded, production-grade firmware for the ESP32-po
 
 ---
 
-## 📡 REST API & Network Endpoints
+## 📡 Network Architecture & Endpoints
 
-The ESP32 broadcasts a Wi-Fi Access Point:
-- **SSID**: `ESP32-Safety-Car`
-- **Password**: `12345678`
-- **Gateway IP**: `http://192.168.4.1`
+The ESP32 firmware operates in **Common Wi-Fi Network Mode (Station)** with built-in zero-lockout fallback:
+- **Common Network (STA)**: Connects to your Wi-Fi router / phone hotspot (configured via `ssid` and `password` in `esp32_rover.ino`).
+- **mDNS Hostname**: `http://esp32-rover.local` (resolves automatically from Laptop, iPhone, Android, and Mac without needing the dynamic DHCP IP).
+- **UDP Auto-Discovery**: Listens on port `4210` for `DISCOVER_ROVER` broadcast packets and replies with its active IP address.
+- **Emergency Fallback Hotspot**: If the common Wi-Fi network cannot be reached within 10 seconds, it automatically launches SoftAP `ESP32-Safety-Car` (`12345678` / `192.168.4.1`).
 
 All endpoints include CORS headers (`Access-Control-Allow-Origin: *`) and handle `OPTIONS` preflight requests so both React Native and Web environments can connect directly.
 

@@ -6,6 +6,8 @@
 
 #include <WiFi.h>
 #include <WebServer.h>
+#include <ESPmDNS.h>
+#include <WiFiUdp.h>
 #include <esp_arduino_version.h>
 #include <Adafruit_NeoPixel.h>
 
@@ -33,13 +35,19 @@
 #define PARK_MIN_SIDE_CM    20    
 #define PARK_CURB_CM        10    
 
-// --- WS2812B NeoPixel Setup ---
+// --- Primary WS2812B NeoPixel Setup (Signals & Indicators) ---
 #define LED_PIN             5     
 #define NUM_LEDS            20    
 #define LED_BRIGHTNESS      120  
 #define REAR_CHASE_REVERSED true  
 
 Adafruit_NeoPixel leds(NUM_LEDS, LED_PIN, NEO_GRB + NEO_KHZ800);
+
+// --- Secondary WS2812B NeoPixel Setup (Pin 14 Neon Blue Accent) ---
+#define LED_PIN_2           14    
+#define NUM_LEDS_2          8     
+
+Adafruit_NeoPixel leds2(NUM_LEDS_2, LED_PIN_2, NEO_GRB + NEO_KHZ800);
 
 // --- PWM Configurations ---
 #define PWM_FREQ        5000 
@@ -57,10 +65,13 @@ unsigned long watchdogMs = 850;
 bool autoBrakeEnabled    = false;
 int obstacleBrakeDist    = 18;
 
-const char *ssid        = "ESP32-Safety-Car";
-const char *password    = "12345678";
+// ======================== COMMON WI-FI NETWORK CONFIG =====================
+const char *ssid        = "Asianet-WIFI";       
+const char *password    = "200C86E89280";       
 
 WebServer server(80);
+WiFiUDP udpServer;
+const unsigned int UDP_PORT = 4210;
 
 // ======================== STATE MACHINE & TELEMETRY =======================
 enum CarState {
@@ -143,6 +154,23 @@ void updateLEDs() {
   unsigned long now = millis();
   bool inRedAlert = (alcoholLock || currentState == STATE_HALTED);
 
+  // --- D14 Accent Strip: Neon Blue when ACTIVE, OFF when HALTED / LOCKED ---
+  static int lastLeds2State = -1;
+  int currentLeds2State = inRedAlert ? 0 : 1;
+
+  if (currentLeds2State != lastLeds2State) {
+    lastLeds2State = currentLeds2State;
+    if (currentLeds2State == 1) {
+      for (int i = 0; i < NUM_LEDS_2; i++) {
+        leds2.setPixelColor(i, leds2.Color(0, 210, 255)); // Neon Cyan/Blue
+      }
+    } else {
+      leds2.clear();
+    }
+    leds2.show();
+  }
+
+  // --- Primary LED Strip State Machine ---
   if (inRedAlert) {
     wasInRedAlert = true;
     if (now - lastLedTick >= 125) {
@@ -181,8 +209,8 @@ void updateLEDs() {
                        (targetLeft > 0 && targetRight > 0 && targetRight > targetLeft);
 
   bool isTurningRight = (targetLeft > 0 && targetRight < 0) ||
-                        (targetLeft < 0 && targetRight < 0 && targetLeft < targetRight) ||
-                        (targetLeft > 0 && targetRight > 0 && targetLeft > targetRight);
+                         (targetLeft < 0 && targetRight < 0 && targetLeft < targetRight) ||
+                         (targetLeft > 0 && targetRight > 0 && targetLeft > targetRight);
 
   if (currentState == STATE_MANUAL && isTurningLeft) {
     if (now - lastLedTick >= 90) {
@@ -238,10 +266,7 @@ void applyMotors(int leftSpeed, int rightSpeed) {
     return;
   }
 
-  // *** THE HARDWARE BROWNOUT FIX ***
-  // 2. Coast Motors (Freewheeling) when target speed is 0.
-  // This prevents the BTS7960 from actively shorting the motor coils to ground,
-  // which causes the massive current spike that browns out the ESP32's Wi-Fi.
+  // 2. Coast Motors (Freewheeling) when target speed is 0
   if (leftSpeed == 0 && rightSpeed == 0) {
     digitalWrite(L_REN, LOW);
     digitalWrite(L_LEN, LOW);
@@ -409,10 +434,16 @@ void handleStatus() {
   json += "\"targetRight\":" + String(targetRight) + ",";
   json += "\"currentLeft\":" + String(currentLeft) + ",";
   json += "\"currentRight\":" + String(currentRight) + ",";
-  json += "\"clients\":" + String(WiFi.softAPgetStationNum()) + ",";
+  String currentIp = (WiFi.status() == WL_CONNECTED) ? WiFi.localIP().toString() : WiFi.softAPIP().toString();
+  String wifiModeStr = (WiFi.status() == WL_CONNECTED) ? "STA" : "AP";
+  json += "\"clients\":0,";
   json += "\"uptime\":" + String(millis() / 1000) + ",";
   json += "\"watchdog\":" + String(remainingWatchdog) + ",";
-  json += "\"autoBrake\":" + String(autoBrakeEnabled ? "true" : "false");
+  json += "\"autoBrake\":" + String(autoBrakeEnabled ? "true" : "false") + ",";
+  json += "\"ip\":\"" + currentIp + "\",";
+  json += "\"ssid\":\"" + String(ssid) + "\",";
+  json += "\"wifiMode\":\"" + wifiModeStr + "\",";
+  json += "\"mdns\":\"http://esp32-rover.local\"";
   json += "}";
 
   server.send(200, "application/json", json);
@@ -464,7 +495,12 @@ void handleCommand() {
   }
 
   String cmd = server.arg("val");
+  cmd.trim();
+  cmd.toUpperCase();
   lastHeartbeat = millis();
+
+  Serial.print("[HTTP CMD] val = ");
+  Serial.println(cmd);
 
   if (server.hasArg("spd")) {
     int s = server.arg("spd").toInt();
@@ -477,10 +513,14 @@ void handleCommand() {
     return;
   }
 
-  if (cmd == "ARM" || cmd == "RESET" || cmd == "RESTORE") {
+  // --- RE-ARM / RE-ENABLE ROUTINE ---
+  if (cmd == "ARM" || cmd == "RESET" || cmd == "RESTORE" || 
+      cmd == "ENABLE" || cmd == "RE-ENABLE" || cmd == "REARM" || 
+      cmd == "RE-ARM" || cmd == "START" || cmd == "RESUME") {
     if (alcoholLock) {
       disconnectTyres();
       server.send(403, "text/plain", "Cannot restore: Alcohol");
+      Serial.println("[ARM REJECTED] Alcohol Lock Active");
       return;
     }
     
@@ -490,16 +530,24 @@ void handleCommand() {
     armMotorsHardware();
     lastHeartbeat = millis();
     server.send(200, "text/plain", "System Armed");
-    Serial.println("[ARMED]"); 
+    Serial.println(">>> [ARMED] System restored to IDLE successfully! <<<"); 
     return;
   }
 
+  // --- STOP COMMAND ROUTINE (ALSO RESTORES TO IDLE IF HALTED) ---
   if (cmd == "S") {
     targetLeft  = 0;
     targetRight = 0;
-    if (currentState == STATE_MANUAL) {
+    
+    // Automatically restore to IDLE if coming from HALTED or MANUAL
+    if (!alcoholLock && (currentState == STATE_HALTED || currentState == STATE_MANUAL)) {
+      currentState = STATE_IDLE;
+      armMotorsHardware();
+      Serial.println(">>> [ARMED VIA S] Car restored to IDLE <<<");
+    } else {
       currentState = STATE_IDLE;
     }
+
     server.send(200, "text/plain", "OK");
     return;
   }
@@ -599,7 +647,10 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
   </style>
 </head>
 <body>
-  <div class="header"><div class="title">ROVER COCKPIT</div></div>
+  <div class="header">
+    <div class="title">ROVER COCKPIT</div>
+    <div id="netInfo" style="font-size:0.75rem; color:#64748b; margin-top:4px; letter-spacing:0.5px;">CONNECTING...</div>
+  </div>
   <div id="status" class="status-bar active">SYSTEM ARMED &bull; READY</div>
   <div class="telemetry">
     <div class="card"><div class="card-label">Front Sonar</div><div id="fDist" class="val">-- cm</div></div>
@@ -682,6 +733,10 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
 
     setInterval(() => {
       fetch('/status', { cache: 'no-store' }).then(r => r.json()).then(d => {
+        if (d.ip) {
+          const netEl = document.getElementById('netInfo');
+          if (netEl) netEl.innerText = (d.wifiMode || 'STA') + ' \u2022 ' + d.ip + ' \u2022 http://esp32-rover.local';
+        }
         document.getElementById('fDist').innerText = d.front + ' cm';
         document.getElementById('lDist').innerText = d.left + ' cm';
         
@@ -751,31 +806,88 @@ void setup() {
   initPwmPin(R_RPWM, R_RPWM_CH);
   initPwmPin(R_LPWM, R_LPWM_CH);
 
+  // Initialize Primary Strip (20 LEDs on Pin 5)
   leds.begin();
   leds.setBrightness(LED_BRIGHTNESS);
+
+  // Initialize Accent Strip (8 LEDs on Pin 14)
+  leds2.begin();
+  leds2.setBrightness(LED_BRIGHTNESS);
+  leds2.clear();
+  leds2.show();
+
   disconnectTyres();
 
   performAlcoholPreCheck();
 
-  WiFi.mode(WIFI_AP);
-  WiFi.softAP(ssid, password);
+  // ======================== COMMON WI-FI NETWORK INITIALIZATION =============
+  WiFi.mode(WIFI_STA); 
+  WiFi.setAutoReconnect(true);
+  WiFi.persistent(true);
+  WiFi.begin(ssid, password);
   WiFi.setSleep(false);
   WiFi.setTxPower(WIFI_POWER_19_5dBm);
 
+  Serial.println("\n--------------------------------------------------");
+  Serial.print("[WIFI] Connecting to common network SSID: ");
+  Serial.println(ssid);
+
+  int attempts = 0;
+  while (WiFi.status() != WL_CONNECTED && attempts < 25) {
+    delay(400);
+    Serial.print(".");
+    attempts++;
+  }
+
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("\n[WIFI] Connected to Common Wi-Fi successfully!");
+    Serial.print("[WIFI] Rover IP Address : http://");
+    Serial.println(WiFi.localIP()); 
+    Serial.print("[WIFI] Gateway          : ");
+    Serial.println(WiFi.gatewayIP());
+    Serial.print("[WIFI] Signal Strength  : ");
+    Serial.print(WiFi.RSSI());
+    Serial.println(" dBm");
+
+    if (MDNS.begin("esp32-rover")) {
+      MDNS.addService("http", "tcp", 80);
+      Serial.println("[mDNS] Responder active at: http://esp32-rover.local");
+    } else {
+      Serial.println("[mDNS] Error setting up mDNS responder");
+    }
+  } else {
+    Serial.println("\n[WIFI] Warning: Could not connect to Station network!");
+    Serial.println("[WIFI] Launching Fallback SoftAP to prevent system lockout...");
+    WiFi.mode(WIFI_AP_STA);
+    WiFi.softAP("ESP32-Safety-Car", "12345678");
+    Serial.print("[WIFI] Emergency AP Active: SSID 'ESP32-Safety-Car' | IP: http://");
+    Serial.println(WiFi.softAPIP());
+    if (MDNS.begin("esp32-rover")) {
+      MDNS.addService("http", "tcp", 80);
+    }
+  }
+
+  udpServer.begin(UDP_PORT);
+  Serial.print("[UDP] Auto-discovery listener active on port ");
+  Serial.println(UDP_PORT);
+  Serial.println("--------------------------------------------------\n"); 
+
   server.on("/", HTTP_GET, handleRoot);
   server.on("/cmd", HTTP_GET, handleCommand);
+  server.on("/cmd", HTTP_POST, handleCommand);
   server.on("/cmd", HTTP_OPTIONS, handleOptions);
   server.on("/drive", HTTP_GET, handleDrive);
+  server.on("/drive", HTTP_POST, handleDrive);
   server.on("/drive", HTTP_OPTIONS, handleOptions);
   server.on("/status", HTTP_GET, handleStatus);
   server.on("/status", HTTP_OPTIONS, handleOptions);
   server.on("/settings", HTTP_GET, handleSettings);
+  server.on("/settings", HTTP_POST, handleSettings);
   server.on("/settings", HTTP_OPTIONS, handleOptions);
   server.on("/ping", HTTP_GET, handlePing);
   server.on("/ping", HTTP_OPTIONS, handleOptions);
 
   server.begin();
-  Serial.println("[WIFI] Access Point Started: ESP32-Safety-Car (192.168.4.1)");
 }
 
 void loop() {
@@ -790,12 +902,10 @@ void loop() {
     
     int rawAlc = analogRead(MQ3_PIN);
     
-    // FIX: Blanking Window to prevent transient brownouts from motor start
     if (currentMillis < ignoreAlcoholUntil) {
         currentAlcoholVal = 0; 
         alcoholStrikeCount = 0;
     } else {
-        // Smooth telemetry display
         currentAlcoholVal = (currentAlcoholVal * 2 + rawAlc) / 3;
         
         if (rawAlc >= ALCOHOL_THRESH) {
@@ -805,7 +915,6 @@ void loop() {
         }
     }
 
-    // Require 400ms sustained detection to trigger Lock
     if (alcoholStrikeCount >= 4) {
       if (!alcoholLock) {
         alcoholLock = true;
@@ -814,7 +923,6 @@ void loop() {
         Serial.println(currentAlcoholVal);
       }
     } 
-    // Auto-Restore when air clears completely
     else if (alcoholStrikeCount == 0 && alcoholLock) {
       alcoholLock = false;
       disconnectTyres();
@@ -848,17 +956,14 @@ void loop() {
     if (frontDist <= obstacleBrakeDist || leftDist <= PARK_CURB_CM) {
       finishAutoPark();
     }
-    // Phase 1 (1.6s): Strong Left Veer
     else if (elapsed < PARK_PHASE1_MS) {
       targetLeft   = -PARK_SPEED;
       targetRight  = -PARK_SPEED / 4;
     }
-    // Phase 2 (1.0s): Straighten Parallel to Curb
     else if (elapsed < (PARK_PHASE1_MS + PARK_PHASE2_MS)) {
       targetLeft   = -PARK_SPEED * 0.6;
       targetRight  = -PARK_SPEED * 0.6;
     }
-    // Phase 3 (0.6s): Soft Brake to prevent jerking
     else if (elapsed < (PARK_PHASE1_MS + PARK_PHASE2_MS + PARK_PHASE3_MS)) {
       targetLeft   = 0;
       targetRight  = 0;
@@ -892,16 +997,35 @@ void loop() {
     if (Serial.available() > 0) {
       String msg = Serial.readStringUntil('\n');
       msg.trim();
+      msg.toUpperCase();
       if (msg == "STOP" || msg == "SLEEP" || msg == "PARK") {
         startAutoPark();
-      } else if (msg == "ARM" || msg == "RESET" || msg == "RESTORE") {
+      } else if (msg == "ARM" || msg == "RESET" || msg == "RESTORE" || 
+                 msg == "ENABLE" || msg == "RE-ENABLE" || msg == "REARM" || 
+                 msg == "RE-ARM" || msg == "START" || msg == "RESUME") {
         if (!alcoholLock) {
           ignoreAlcoholUntil = millis() + 2500;
           currentState = STATE_IDLE;
           armMotorsHardware();
           lastHeartbeat = millis();
+          Serial.println("[ARMED]");
         } 
       }
+    }
+  }
+
+  // 7. Process UDP Discovery Requests
+  int packetSize = udpServer.parsePacket();
+  if (packetSize) {
+    char packetBuffer[64];
+    int len = udpServer.read(packetBuffer, sizeof(packetBuffer) - 1);
+    if (len > 0) packetBuffer[len] = 0;
+    if (strstr(packetBuffer, "DISCOVER_ROVER")) {
+      IPAddress myIp = (WiFi.status() == WL_CONNECTED) ? WiFi.localIP() : WiFi.softAPIP();
+      String reply = "ROVER_HERE:http://" + myIp.toString();
+      udpServer.beginPacket(udpServer.remoteIP(), udpServer.remotePort());
+      udpServer.print(reply);
+      udpServer.endPacket();
     }
   }
 }
