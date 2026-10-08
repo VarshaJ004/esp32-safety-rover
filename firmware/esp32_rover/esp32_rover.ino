@@ -1,95 +1,239 @@
-
 /*
  * ==============================================================================
  * ESP32 Autonomous & Manual Safety Rover Controller Firmware
- * ==============================================================================
- * Target Hardware: ESP32 Development Board (NodeMCU / DevKit v1)
- * Motor Driver:    Dual BTS7960 43A H-Bridge Drivers
- * Sensors:         HC-SR04 / JSN-SR04T Ultrasonic Sensors (Front & Left)
- * Communication:   WiFi Access Point (192.168.4.1), HTTP REST API + WebSockets/CORS
- * Companion App:   Expo React Native Mobile App & Built-in Web Cockpit
- *
- * Supported Commands:
- *  - GET /cmd?val=F|B|L|R|FL|FR|BL|BR|S|STOP|PARK|SLEEP [&spd=0..255]
- *  - GET /drive?left=-255..255&right=-255..255 (Direct Proportional Steering)
- *  - GET /status -> Full JSON Telemetry (Distances, State, Battery, Motor levels)
- *  - GET /settings?speed=...&turn=...&brake=0|1&watchdog=...
- *  - GET /ping   -> Low-latency connection check
  * ==============================================================================
  */
 
 #include <WiFi.h>
 #include <WebServer.h>
+#include <ESPmDNS.h>
+#include <WiFiUdp.h>
 #include <esp_arduino_version.h>
+#include <Adafruit_NeoPixel.h>
 
 // ======================== HARDWARE PIN DEFINITIONS ========================
+#define L_RPWM          19   
+#define L_LPWM          18   
+#define L_REN           21   
+#define L_LEN           22   
 
-// --- Left BTS7960 Driver Pins ---
-#define L_RPWM          19   // Forward PWM
-#define L_LPWM          18   // Reverse PWM
-#define L_REN           21   // Forward Enable
-#define L_LEN           22   // Reverse Enable
+#define R_RPWM          25   
+#define R_LPWM          23   
+#define R_REN           27   
+#define R_LEN           32   
 
-// --- Right BTS7960 Driver Pins ---
-#define R_RPWM          25   // Forward PWM
-#define R_LPWM          23   // Reverse PWM
-#define R_REN           27   // Forward Enable
-#define R_LEN           32   // Reverse Enable
+// --- Alcohol Sensor & Buzzer ---
+#define MQ3_PIN         34   
+#define BUZZER_PIN      4    
+#define ALCOHOL_THRESH  3000 
 
-// --- Ultrasonic Sensors ---
-#define TRIG_FRONT      4
-#define ECHO_FRONT      16
-#define TRIG_LEFT       26
-#define ECHO_LEFT       17
+// --- 3-Phase Auto-Park Trajectory Settings ---
+#define PARK_SPEED          135   
+#define PARK_PHASE1_MS      1600  // Arc left
+#define PARK_PHASE2_MS      1000  // Straighten parallel to curb
+#define PARK_PHASE3_MS      600   // Soft brake to a halt
+#define PARK_MIN_SIDE_CM    20    
+#define PARK_CURB_CM        10    
+
+// --- Primary WS2812B NeoPixel Setup (Signals & Indicators) ---
+#define LED_PIN             5     
+#define NUM_LEDS            20    
+#define LED_BRIGHTNESS      120  
+#define REAR_CHASE_REVERSED true  
+
+Adafruit_NeoPixel leds(NUM_LEDS, LED_PIN, NEO_GRB + NEO_KHZ800);
+
+// --- Secondary WS2812B NeoPixel Setup (Pin 14 Neon Blue Accent) ---
+#define LED_PIN_2           14    
+#define NUM_LEDS_2          8     
+
+Adafruit_NeoPixel leds2(NUM_LEDS_2, LED_PIN_2, NEO_GRB + NEO_KHZ800);
 
 // --- PWM Configurations ---
-#define PWM_FREQ        5000 // 5 kHz (silent motor switching)
-#define PWM_RES         8    // 8-bit resolution (0 - 255)
+#define PWM_FREQ        5000 
+#define PWM_RES         8    
 
-// Core 2.x backward compatibility channels
 #define L_RPWM_CH       0
 #define L_LPWM_CH       1
 #define R_RPWM_CH       2
 #define R_LPWM_CH       3
 
 // ======================== DEFAULT OPERATIONAL VALUES ======================
-int manualSpeed         = 180;  // Normal driving speed (0 - 255)
-int turnSpeed           = 155;  // Pivot turning speed (0 - 255)
-unsigned long watchdogMs = 650;  // Auto-stop if no command received within window
-bool autoBrakeEnabled   = true; // Prevent front collision if distance < obstacleBrakeDist
-int obstacleBrakeDist   = 18;   // Minimum distance in cm to trigger auto-brake
+int manualSpeed          = 180;
+int turnSpeed            = 155;
+unsigned long watchdogMs = 850; 
+bool autoBrakeEnabled    = false;
+int obstacleBrakeDist    = 18;
 
-// --- Access Point Credentials ---
-const char *ssid        = "ESP32-Safety-Car";
-const char *password    = "12345678";
+// ======================== COMMON WI-FI NETWORK CONFIG =====================
+const char *ssid        = "X200 fe";       
+const char *password    = "josh1234";       
 
-// --- WebServer Instance (Port 80) ---
 WebServer server(80);
+WiFiUDP udpServer;
+const unsigned int UDP_PORT = 4210;
 
 // ======================== STATE MACHINE & TELEMETRY =======================
 enum CarState {
   STATE_IDLE,
   STATE_MANUAL,
-  STATE_HALTED
+  STATE_HALTED,
+  STATE_PARKING
 };
 
 volatile CarState currentState = STATE_IDLE;
 volatile long frontDist        = 200;
 volatile long leftDist         = 200;
 
-// Motor Ramp Targets for Smooth Motion (prevents high inrush currents)
+volatile int currentAlcoholVal = 0;
+volatile bool alcoholLock      = false;
+
+// Hardware Noise Filters
+int alcoholStrikeCount             = 0;
+unsigned long ignoreAlcoholUntil   = 0; 
+
 int targetLeft   = 0;
 int targetRight  = 0;
 int currentLeft  = 0;
 int currentRight = 0;
 
-unsigned long lastSensorTick = 0;
-unsigned long lastRampTick   = 0;
-unsigned long lastHeartbeat  = 0;
-bool alternateSensor         = false;
+unsigned long lastSensorTick   = 0;
+unsigned long lastRampTick     = 0;
+unsigned long lastHeartbeat    = 0;
+unsigned long lastAlcoholTick  = 0;
+unsigned long lastSerialDebug  = 0;
+unsigned long parkStartMs      = 0;
+
+unsigned long greenClearUntil  = 0;
+bool wasInRedAlert             = false;
+
+// ======================== LED CONTROL ROUTINES ===========================
+unsigned long lastLedTick = 0;
+int ledChasePosition      = 0;
+bool redBlinkState        = false;
+
+void ledsOff() { leds.clear(); leds.show(); }
+
+void ledsWhite() {
+  for (int i = 0; i < NUM_LEDS; i++) leds.setPixelColor(i, leds.Color(255, 255, 255));
+  leds.show();
+}
+
+void ledsGreen() {
+  for (int i = 0; i < NUM_LEDS; i++) leds.setPixelColor(i, leds.Color(0, 255, 0));
+  leds.show();
+}
+
+void drawChase(int frontBase, int rearBase) {
+  leds.clear();
+  int headPos  = ledChasePosition;
+  int tailPos  = (ledChasePosition + 4) % 5;
+  int rearHead = REAR_CHASE_REVERSED ? (4 - headPos) : headPos;
+  int rearTail = REAR_CHASE_REVERSED ? (4 - tailPos) : tailPos;
+
+  leds.setPixelColor(frontBase + headPos, leds.Color(255, 90, 0));
+  leds.setPixelColor(frontBase + tailPos, leds.Color(100, 35, 0));
+  leds.setPixelColor(rearBase + rearHead, leds.Color(255, 90, 0));
+  leds.setPixelColor(rearBase + rearTail, leds.Color(100, 35, 0));
+  leds.show();
+}
+
+void ledsLeftIndicator()  { drawChase(5, 10); } 
+void ledsRightIndicator() { drawChase(0, 15); } 
+
+void ledsBlinkRed() {
+  if (redBlinkState) {
+    for (int i = 0; i < NUM_LEDS; i++) leds.setPixelColor(i, leds.Color(255, 0, 0));
+  } else {
+    leds.clear();
+  }
+  leds.show();
+}
+
+void updateLEDs() {
+  unsigned long now = millis();
+  bool inRedAlert = (alcoholLock || currentState == STATE_HALTED);
+
+  // --- D14 Accent Strip: Neon Blue when ACTIVE, OFF when HALTED / LOCKED ---
+  static int lastLeds2State = -1;
+  int currentLeds2State = inRedAlert ? 0 : 1;
+
+  if (currentLeds2State != lastLeds2State) {
+    lastLeds2State = currentLeds2State;
+    if (currentLeds2State == 1) {
+      for (int i = 0; i < NUM_LEDS_2; i++) {
+        leds2.setPixelColor(i, leds2.Color(0, 210, 255)); // Neon Cyan/Blue
+      }
+    } else {
+      leds2.clear();
+    }
+    leds2.show();
+  }
+
+  // --- Primary LED Strip State Machine ---
+  if (inRedAlert) {
+    wasInRedAlert = true;
+    if (now - lastLedTick >= 125) {
+      lastLedTick = now;
+      redBlinkState = !redBlinkState;
+      ledsBlinkRed();
+      digitalWrite(BUZZER_PIN, redBlinkState ? HIGH : LOW);
+    }
+    return;
+  }
+
+  if (wasInRedAlert) {
+    wasInRedAlert = false;
+    greenClearUntil = now + 3000;
+  }
+
+  digitalWrite(BUZZER_PIN, LOW);
+  redBlinkState = false;
+
+  if (now < greenClearUntil) {
+    ledsGreen();
+    return;
+  }
+
+  if (currentState == STATE_PARKING) {
+    if (now - lastLedTick >= 90) {
+      lastLedTick = now;
+      ledChasePosition = (ledChasePosition + 1) % 5;
+      ledsLeftIndicator();
+    }
+    return;
+  }
+
+  bool isTurningLeft = (targetLeft < 0 && targetRight > 0) ||
+                       (targetLeft < 0 && targetRight < 0 && targetRight < targetLeft) ||
+                       (targetLeft > 0 && targetRight > 0 && targetRight > targetLeft);
+
+  bool isTurningRight = (targetLeft > 0 && targetRight < 0) ||
+                         (targetLeft < 0 && targetRight < 0 && targetLeft < targetRight) ||
+                         (targetLeft > 0 && targetRight > 0 && targetLeft > targetRight);
+
+  if (currentState == STATE_MANUAL && isTurningLeft) {
+    if (now - lastLedTick >= 90) {
+      lastLedTick = now;
+      ledChasePosition = (ledChasePosition + 1) % 5;
+      ledsLeftIndicator();
+    }
+    return;
+  }
+
+  if (currentState == STATE_MANUAL && isTurningRight) {
+    if (now - lastLedTick >= 90) {
+      lastLedTick = now;
+      ledChasePosition = (ledChasePosition + 1) % 5;
+      ledsRightIndicator();
+    }
+    return;
+  }
+
+  ledsWhite();
+}
 
 // ======================== HARDWARE PWM ABSTRACTIONS =======================
-// Compatible with both ESP32 Arduino Core 2.x and Core 3.x
 void writePwm(uint8_t pin, uint8_t channel, int value) {
   value = constrain(value, 0, 255);
 #if defined(ESP_ARDUINO_VERSION_MAJOR) && (ESP_ARDUINO_VERSION_MAJOR >= 3)
@@ -108,68 +252,75 @@ void initPwmPin(uint8_t pin, uint8_t channel) {
 #endif
 }
 
-// Low-level hardware register write with gate isolation
 void applyMotors(int leftSpeed, int rightSpeed) {
+  // 1. Emergency Halt or Lock: Fully disable drivers
+  if (alcoholLock || currentState == STATE_HALTED) {
+    digitalWrite(L_REN, LOW);
+    digitalWrite(L_LEN, LOW);
+    digitalWrite(R_REN, LOW);
+    digitalWrite(R_LEN, LOW);
+    writePwm(L_RPWM, L_RPWM_CH, 0);
+    writePwm(L_LPWM, L_LPWM_CH, 0);
+    writePwm(R_RPWM, R_RPWM_CH, 0);
+    writePwm(R_LPWM, R_LPWM_CH, 0);
+    return;
+  }
+
+  // 2. Coast Motors (Freewheeling) when target speed is 0
+  if (leftSpeed == 0 && rightSpeed == 0) {
+    digitalWrite(L_REN, LOW);
+    digitalWrite(L_LEN, LOW);
+    digitalWrite(R_REN, LOW);
+    digitalWrite(R_LEN, LOW);
+    writePwm(L_RPWM, L_RPWM_CH, 0);
+    writePwm(L_LPWM, L_LPWM_CH, 0);
+    writePwm(R_RPWM, R_RPWM_CH, 0);
+    writePwm(R_LPWM, R_LPWM_CH, 0);
+    return;
+  }
+
+  // 3. Normal Driving: Enable drivers and apply PWM
+  digitalWrite(L_REN, HIGH);
+  digitalWrite(L_LEN, HIGH);
+  digitalWrite(R_REN, HIGH);
+  digitalWrite(R_LEN, HIGH);
+
   leftSpeed  = constrain(leftSpeed, -255, 255);
   rightSpeed = constrain(rightSpeed, -255, 255);
 
-  // Left Bridge
-  if (leftSpeed == 0) {
-    writePwm(L_RPWM, L_RPWM_CH, 0);
+  if (leftSpeed >= 0) {
+    writePwm(L_RPWM, L_RPWM_CH, leftSpeed);
     writePwm(L_LPWM, L_LPWM_CH, 0);
-    digitalWrite(L_REN, LOW);
-    digitalWrite(L_LEN, LOW);
   } else {
-    digitalWrite(L_REN, HIGH);
-    digitalWrite(L_LEN, HIGH);
-    if (leftSpeed > 0) {
-      writePwm(L_RPWM, L_RPWM_CH, leftSpeed);
-      writePwm(L_LPWM, L_LPWM_CH, 0);
-    } else {
-      writePwm(L_RPWM, L_RPWM_CH, 0);
-      writePwm(L_LPWM, L_LPWM_CH, abs(leftSpeed));
-    }
+    writePwm(L_RPWM, L_RPWM_CH, 0);
+    writePwm(L_LPWM, L_LPWM_CH, abs(leftSpeed));
   }
 
-  // Right Bridge
-  if (rightSpeed == 0) {
-    writePwm(R_RPWM, R_RPWM_CH, 0);
+  if (rightSpeed >= 0) {
+    writePwm(R_RPWM, R_RPWM_CH, rightSpeed);
     writePwm(R_LPWM, R_LPWM_CH, 0);
-    digitalWrite(R_REN, LOW);
-    digitalWrite(R_LEN, LOW);
   } else {
-    digitalWrite(R_REN, HIGH);
-    digitalWrite(R_LEN, HIGH);
-    if (rightSpeed > 0) {
-      writePwm(R_RPWM, R_RPWM_CH, rightSpeed);
-      writePwm(R_LPWM, R_LPWM_CH, 0);
-    } else {
-      writePwm(R_RPWM, R_RPWM_CH, 0);
-      writePwm(R_LPWM, R_LPWM_CH, abs(rightSpeed));
-    }
+    writePwm(R_RPWM, R_RPWM_CH, 0);
+    writePwm(R_LPWM, R_LPWM_CH, abs(rightSpeed));
   }
 }
 
-// Complete physical tyre disconnect (Floats all MOSFET gates for safety)
 void disconnectTyres() {
   targetLeft   = 0;
   targetRight  = 0;
   currentLeft  = 0;
   currentRight = 0;
-
-  writePwm(L_RPWM, L_RPWM_CH, 0);
-  writePwm(L_LPWM, L_LPWM_CH, 0);
-  writePwm(R_RPWM, R_RPWM_CH, 0);
-  writePwm(R_LPWM, R_LPWM_CH, 0);
-
-  // Disabling the bridge lines cuts all current to the motors completely
-  digitalWrite(L_REN, LOW);
-  digitalWrite(L_LEN, LOW);
-  digitalWrite(R_REN, LOW);
-  digitalWrite(R_LEN, LOW);
+  applyMotors(0, 0);
 }
 
-// Software Acceleration Ramping (Smooth ramp prevents mechanical & electrical shock)
+void armMotorsHardware() {
+  targetLeft   = 0;
+  targetRight  = 0;
+  currentLeft  = 0;
+  currentRight = 0;
+  applyMotors(0, 0); 
+}
+
 void updateMotorRamp() {
   const int RAMP_STEP = 25;
 
@@ -182,18 +333,63 @@ void updateMotorRamp() {
   applyMotors(currentLeft, currentRight);
 }
 
-// Fast ultrasonic read: 6ms timeout prevents CPU lock
-long readDistanceNonBlock(int trigPin, int echoPin) {
-  digitalWrite(trigPin, LOW);
-  delayMicroseconds(2);
-  digitalWrite(trigPin, HIGH);
-  delayMicroseconds(10);
-  digitalWrite(trigPin, LOW);
-  long duration = pulseIn(echoPin, HIGH, 6000);
-  if (duration == 0) return 150;
-  long dist = duration * 0.034 / 2;
-  if (dist <= 0 || dist > 400) return 150;
-  return dist;
+// ======================== AUTO-PARK CONTROL ==============================
+void finishAutoPark() {
+  disconnectTyres();
+  currentState = STATE_HALTED;
+  Serial.println("[PARK] Auto-park complete. Car fully stopped and locked. Manual Re-Arm required.");
+}
+
+void startAutoPark() {
+  if (currentState == STATE_HALTED || currentState == STATE_PARKING) return;
+
+  bool moving = (currentLeft != 0 || currentRight != 0 || targetLeft != 0 || targetRight != 0);
+  bool reversing = (currentLeft > 0 && currentRight > 0);
+
+  if (!moving || reversing || alcoholLock) {
+    finishAutoPark();
+    return;
+  }
+
+  parkStartMs  = millis();
+  currentState = STATE_PARKING;
+  
+  targetLeft   = -PARK_SPEED; 
+  targetRight  = -PARK_SPEED / 4;     
+  Serial.println("[PARK] Microsleep detected: Starting left auto-park maneuver...");
+}
+
+// ======================== SAFE BOOT PRE-CHECK =============================
+void performAlcoholPreCheck() {
+  pinMode(BUZZER_PIN, OUTPUT);
+  digitalWrite(BUZZER_PIN, LOW);
+  pinMode(MQ3_PIN, INPUT);
+
+  digitalWrite(BUZZER_PIN, HIGH);
+  delay(100);
+  digitalWrite(BUZZER_PIN, LOW);
+
+  for (int i = 0; i < NUM_LEDS; i++) leds.setPixelColor(i, leds.Color(255, 120, 0));
+  leds.show();
+
+  Serial.println("[BOOT] Sampling baseline MQ-3 air reading...");
+  long sum = 0;
+  for (int i = 0; i < 20; i++) {
+    sum += analogRead(MQ3_PIN);
+    delay(50);
+  }
+  currentAlcoholVal = sum / 20;
+
+  if (currentAlcoholVal >= ALCOHOL_THRESH) {
+    alcoholLock = true;
+    wasInRedAlert = true;
+    Serial.println("[BOOT] Alcohol detected on boot! Ignition locked.");
+  } else {
+    alcoholLock = false;
+    greenClearUntil = millis() + 3000;
+    ledsGreen();
+    Serial.println("[BOOT] Air clean. System Armed (3s Green Confirmation).");
+  }
 }
 
 // ======================== HTTP API & CORS HELPERS =========================
@@ -204,22 +400,19 @@ void setCorsHeaders() {
   server.sendHeader("Cache-Control", "no-cache, no-store, must-revalidate");
 }
 
-void handleOptions() {
-  setCorsHeaders();
-  server.send(204);
-}
+void handleOptions() { setCorsHeaders(); server.send(204); }
 
-// Ping / Heartbeat check
 void handlePing() {
   setCorsHeaders();
   server.send(200, "application/json", "{\"pong\":true,\"uptime\":" + String(millis() / 1000) + "}");
 }
 
-// Telemetry endpoint for mobile app
 void handleStatus() {
   setCorsHeaders();
   String st = "IDLE";
-  if (currentState == STATE_HALTED) st = "HALTED";
+  if (alcoholLock) st = "ALCOHOL_LOCKED";
+  else if (currentState == STATE_PARKING) st = "PARKING";
+  else if (currentState == STATE_HALTED) st = "HALTED";
   else if (currentState == STATE_MANUAL) st = "MANUAL";
 
   unsigned long remainingWatchdog = 0;
@@ -232,58 +425,67 @@ void handleStatus() {
   json += "\"front\":" + String(frontDist) + ",";
   json += "\"left\":" + String(leftDist) + ",";
   json += "\"state\":\"" + st + "\",";
+  json += "\"alcohol\":" + String(currentAlcoholVal) + ",";
+  json += "\"threshold\":" + String(ALCOHOL_THRESH) + ",";
+  json += "\"alcoholDetected\":" + String(alcoholLock ? "true" : "false") + ",";
   json += "\"speed\":" + String(manualSpeed) + ",";
   json += "\"turnSpeed\":" + String(turnSpeed) + ",";
   json += "\"targetLeft\":" + String(targetLeft) + ",";
   json += "\"targetRight\":" + String(targetRight) + ",";
   json += "\"currentLeft\":" + String(currentLeft) + ",";
   json += "\"currentRight\":" + String(currentRight) + ",";
-  json += "\"clients\":" + String(WiFi.softAPgetStationNum()) + ",";
+  String currentIp = (WiFi.status() == WL_CONNECTED) ? WiFi.localIP().toString() : WiFi.softAPIP().toString();
+  String wifiModeStr = (WiFi.status() == WL_CONNECTED) ? "STA" : "AP";
+  json += "\"clients\":0,";
   json += "\"uptime\":" + String(millis() / 1000) + ",";
   json += "\"watchdog\":" + String(remainingWatchdog) + ",";
-  json += "\"autoBrake\":" + String(autoBrakeEnabled ? "true" : "false");
+  json += "\"autoBrake\":" + String(autoBrakeEnabled ? "true" : "false") + ",";
+  json += "\"ip\":\"" + currentIp + "\",";
+  json += "\"ssid\":\"" + String(ssid) + "\",";
+  json += "\"wifiMode\":\"" + wifiModeStr + "\",";
+  json += "\"mdns\":\"http://esp32-rover.local\"";
   json += "}";
 
   server.send(200, "application/json", json);
 }
 
-// Differential Joystick Drive API: /drive?left=-255..255&right=-255..255
 void handleDrive() {
   setCorsHeaders();
   lastHeartbeat = millis();
 
+  if (alcoholLock) {
+    disconnectTyres();
+    server.send(403, "application/json", "{\"error\":\"Ignition locked.\"}");
+    return;
+  }
+
+  if (currentState == STATE_PARKING) {
+    server.send(403, "application/json", "{\"error\":\"Auto-parking.\"}");
+    return;
+  }
+
   if (currentState == STATE_HALTED) {
     disconnectTyres();
-    server.send(403, "application/json", "{\"error\":\"Vehicle halted. Tap STOP to re-arm.\"}");
+    server.send(403, "application/json", "{\"error\":\"Vehicle halted.\"}");
     return;
   }
 
   if (server.hasArg("left") && server.hasArg("right")) {
-    int reqLeft  = server.arg("left").toInt();
-    int reqRight = server.arg("right").toInt();
+    int reqLeft  = -server.arg("left").toInt();
+    int reqRight = -server.arg("right").toInt();
 
     reqLeft  = constrain(reqLeft, -255, 255);
     reqRight = constrain(reqRight, -255, 255);
 
-    // Front obstacle auto-brake check
-    if (autoBrakeEnabled && frontDist < obstacleBrakeDist && (reqLeft > 0 || reqRight > 0)) {
-      targetLeft = 0;
-      targetRight = 0;
-      currentState = STATE_IDLE;
-      server.send(200, "application/json", "{\"status\":\"BRAKED\",\"reason\":\"Front obstacle detected\"}");
-      return;
-    }
-
-    targetLeft  = reqLeft;
-    targetRight = reqRight;
+    targetLeft   = reqLeft;
+    targetRight  = reqRight;
     currentState = (targetLeft == 0 && targetRight == 0) ? STATE_IDLE : STATE_MANUAL;
-    server.send(200, "application/json", "{\"status\":\"OK\",\"left\":" + String(targetLeft) + ",\"right\":" + String(targetRight) + "}");
+    server.send(200, "application/json", "{\"status\":\"OK\"}");
   } else {
-    server.send(400, "application/json", "{\"error\":\"Missing left or right parameters\"}");
+    server.send(400, "application/json", "{\"error\":\"Missing params\"}");
   }
 }
 
-// Directional Commands: /cmd?val=F|B|L|R|FL|FR|BL|BR|S|STOP [&spd=0..255]
 void handleCommand() {
   setCorsHeaders();
 
@@ -293,55 +495,76 @@ void handleCommand() {
   }
 
   String cmd = server.arg("val");
+  cmd.trim();
+  cmd.toUpperCase();
   lastHeartbeat = millis();
 
-  // Allow dynamic speed override if provided
+  Serial.print("[HTTP CMD] val = ");
+  Serial.println(cmd);
+
   if (server.hasArg("spd")) {
     int s = server.arg("spd").toInt();
     if (s >= 50 && s <= 255) manualSpeed = s;
   }
 
-  // 1. MICROSLEEP / EMERGENCY STOP TRIGGER
   if (cmd == "STOP" || cmd == "PARK" || cmd == "SLEEP") {
-    disconnectTyres();
-    currentState = STATE_HALTED;
-    Serial.println("[EMERGENCY] Microsleep triggered -> All tyres completely disconnected.");
-    server.send(200, "text/plain", "Tyres Disconnected");
+    startAutoPark();
+    server.send(200, "text/plain", currentState == STATE_PARKING ? "Auto-Parking" : "Parked");
     return;
   }
 
-  // 2. USER TAPS STOP BUTTON: Clears the lock and arms the vehicle
-  if (cmd == "S") {
-    disconnectTyres();
-    currentState = STATE_IDLE;
-    Serial.println("[RESET] Stop tapped -> Power restored, vehicle armed.");
+  // --- RE-ARM / RE-ENABLE ROUTINE ---
+  if (cmd == "ARM" || cmd == "RESET" || cmd == "RESTORE" || 
+      cmd == "ENABLE" || cmd == "RE-ENABLE" || cmd == "REARM" || 
+      cmd == "RE-ARM" || cmd == "START" || cmd == "RESUME") {
+    if (alcoholLock) {
+      disconnectTyres();
+      server.send(403, "text/plain", "Cannot restore: Alcohol");
+      Serial.println("[ARM REJECTED] Alcohol Lock Active");
+      return;
+    }
+    
+    ignoreAlcoholUntil = millis() + 2500;
+    
+    currentState = STATE_IDLE; 
+    armMotorsHardware();
+    lastHeartbeat = millis();
     server.send(200, "text/plain", "System Armed");
+    Serial.println(">>> [ARMED] System restored to IDLE successfully! <<<"); 
     return;
   }
 
-  // 3. HARD INTERLOCK: Block directional input if car is halted
-  if (currentState == STATE_HALTED) {
+  // --- STOP COMMAND ROUTINE (ALSO RESTORES TO IDLE IF HALTED) ---
+  if (cmd == "S") {
+    targetLeft  = 0;
+    targetRight = 0;
+    
+    // Automatically restore to IDLE if coming from HALTED or MANUAL
+    if (!alcoholLock && (currentState == STATE_HALTED || currentState == STATE_MANUAL)) {
+      currentState = STATE_IDLE;
+      armMotorsHardware();
+      Serial.println(">>> [ARMED VIA S] Car restored to IDLE <<<");
+    } else {
+      currentState = STATE_IDLE;
+    }
+
+    server.send(200, "text/plain", "OK");
+    return;
+  }
+
+  if (currentState == STATE_HALTED || currentState == STATE_PARKING || alcoholLock) {
     disconnectTyres();
-    server.send(403, "text/plain", "Locked: Tap STOP to Re-Arm");
+    server.send(403, "text/plain", "Locked");
     return;
   }
 
-  // 4. Auto-brake obstacle check for forward motion
-  if (autoBrakeEnabled && frontDist < obstacleBrakeDist && (cmd == "F" || cmd == "FL" || cmd == "FR")) {
-    disconnectTyres();
-    currentState = STATE_IDLE;
-    server.send(200, "text/plain", "Obstacle Auto-Brake");
-    return;
-  }
-
-  // 5. Directional Maneuvers
   if (cmd == "F") {
-    targetLeft  = manualSpeed;
-    targetRight = manualSpeed;
-    currentState = STATE_MANUAL;
-  } else if (cmd == "B") {
     targetLeft  = -manualSpeed;
     targetRight = -manualSpeed;
+    currentState = STATE_MANUAL;
+  } else if (cmd == "B") {
+    targetLeft  = manualSpeed;
+    targetRight = manualSpeed;
     currentState = STATE_MANUAL;
   } else if (cmd == "L") {
     targetLeft  = -turnSpeed;
@@ -352,23 +575,22 @@ void handleCommand() {
     targetRight = -turnSpeed;
     currentState = STATE_MANUAL;
   } else if (cmd == "FL") {
-    targetLeft  = manualSpeed / 2;
-    targetRight = manualSpeed;
-    currentState = STATE_MANUAL;
-  } else if (cmd == "FR") {
-    targetLeft  = manualSpeed;
-    targetRight = manualSpeed / 2;
-    currentState = STATE_MANUAL;
-  } else if (cmd == "BL") {
     targetLeft  = -manualSpeed / 2;
     targetRight = -manualSpeed;
     currentState = STATE_MANUAL;
-  } else if (cmd == "BR") {
+  } else if (cmd == "FR") {
     targetLeft  = -manualSpeed;
     targetRight = -manualSpeed / 2;
     currentState = STATE_MANUAL;
+  } else if (cmd == "BL") {
+    targetLeft  = manualSpeed / 2;
+    targetRight = manualSpeed;
+    currentState = STATE_MANUAL;
+  } else if (cmd == "BR") {
+    targetLeft  = manualSpeed;
+    targetRight = manualSpeed / 2;
+    currentState = STATE_MANUAL;
   } else {
-    // Unrecognized command -> safe stop
     targetLeft  = 0;
     targetRight = 0;
     currentState = STATE_IDLE;
@@ -377,21 +599,12 @@ void handleCommand() {
   server.send(200, "text/plain", "OK");
 }
 
-// Runtime Settings Endpoint: /settings?speed=180&turn=155&brake=1&watchdog=650
 void handleSettings() {
   setCorsHeaders();
-  if (server.hasArg("speed")) {
-    manualSpeed = constrain(server.arg("speed").toInt(), 60, 255);
-  }
-  if (server.hasArg("turn")) {
-    turnSpeed = constrain(server.arg("turn").toInt(), 60, 255);
-  }
-  if (server.hasArg("brake")) {
-    autoBrakeEnabled = (server.arg("brake") == "1" || server.arg("brake") == "true");
-  }
-  if (server.hasArg("watchdog")) {
-    watchdogMs = constrain(server.arg("watchdog").toInt(), 200, 3000);
-  }
+  if (server.hasArg("speed"))    manualSpeed = constrain(server.arg("speed").toInt(), 60, 255);
+  if (server.hasArg("turn"))     turnSpeed = constrain(server.arg("turn").toInt(), 60, 255);
+  if (server.hasArg("brake"))    autoBrakeEnabled = (server.arg("brake") == "1" || server.arg("brake") == "true");
+  if (server.hasArg("watchdog")) watchdogMs = constrain(server.arg("watchdog").toInt(), 200, 3000);
 
   String json = "{\"status\":\"OK\",\"speed\":" + String(manualSpeed) +
                 ",\"turnSpeed\":" + String(turnSpeed) +
@@ -409,240 +622,267 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
   <title>ESP32 Safety Rover HUD</title>
   <style>
-    :root {
-      --bg: #090d16;
-      --card-bg: #131c2e;
-      --border: #1e293b;
-      --primary: #00f0ff;
-      --danger: #ef4444;
-      --success: #10b981;
-      --warn: #f59e0b;
-    }
-    * { box-sizing: border-box; margin: 0; padding: 0; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; user-select: none; -webkit-user-select: none; touch-action: manipulation; }
-    body { background: var(--bg); color: #e2e8f0; display: flex; flex-direction: column; align-items: center; min-height: 100vh; padding: 16px; }
+    :root { --bg: #090d16; --card-bg: #131c2e; --border: #1e293b; --primary: #00f0ff; --danger: #ef4444; --success: #10b981; }
+    * { box-sizing: border-box; margin: 0; padding: 0; font-family: system-ui, -apple-system, sans-serif; user-select: none; -webkit-user-select: none; }
+    body { background: var(--bg); color: #e2e8f0; display: flex; flex-direction: column; align-items: center; min-height: 100vh; padding: 16px; touch-action: pan-y; }
     .header { width: 100%; max-width: 420px; display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; }
-    .title { font-size: 1.1rem; font-weight: 700; color: var(--primary); letter-spacing: 1px; display: flex; align-items: center; gap: 8px; }
-    .badge-dot { width: 10px; height: 10px; border-radius: 50%; background: var(--success); box-shadow: 0 0 10px var(--success); }
-    .status-bar { width: 100%; max-width: 420px; padding: 12px; border-radius: 12px; text-align: center; font-weight: 700; font-size: 0.9rem; margin-bottom: 16px; background: var(--card-bg); border: 1px solid var(--border); transition: all 0.3s; }
-    .status-bar.alert { background: rgba(239, 68, 68, 0.2); border-color: var(--danger); color: #fca5a5; animation: blink 1.2s infinite; }
+    .title { font-size: 1.1rem; font-weight: 700; color: var(--primary); letter-spacing: 1px; }
+    .status-bar { width: 100%; max-width: 420px; padding: 12px; border-radius: 12px; text-align: center; font-weight: 700; font-size: 0.9rem; margin-bottom: 16px; background: var(--card-bg); border: 1px solid var(--border); transition: all 0.2s; }
+    .status-bar.alert { background: rgba(239, 68, 68, 0.2); border-color: var(--danger); color: #fca5a5; }
+    .status-bar.warn { background: rgba(255, 140, 0, 0.2); border-color: #ff8c00; color: #ffbe76; }
     .status-bar.active { background: rgba(0, 240, 255, 0.15); border-color: var(--primary); color: var(--primary); }
-    @keyframes blink { 0%, 100% { opacity: 1; } 50% { opacity: 0.5; } }
-    .telemetry { display: flex; gap: 12px; width: 100%; max-width: 420px; margin-bottom: 18px; }
-    .card { flex: 1; background: var(--card-bg); border: 1px solid var(--border); padding: 14px; border-radius: 12px; text-align: center; }
-    .card-label { font-size: 0.72rem; color: #94a3b8; font-weight: 600; text-transform: uppercase; letter-spacing: 0.5px; }
-    .val { font-size: 1.6rem; font-weight: 800; color: var(--primary); margin-top: 4px; }
-    .val.close { color: var(--danger) !important; }
-    .grid { display: grid; grid-template-columns: repeat(3, 85px); grid-template-rows: repeat(3, 85px); gap: 14px; justify-content: center; margin-bottom: 20px; }
-    .btn { background: #1e293b; border: 1px solid #334155; border-radius: 18px; color: white; font-size: 1.8rem; display: flex; align-items: center; justify-content: center; cursor: pointer; transition: all 0.08s; box-shadow: 0 4px 12px rgba(0,0,0,0.3); }
-    .btn:active, .btn.pressed { background: var(--primary); color: #000; transform: scale(0.95); box-shadow: 0 0 20px rgba(0,240,255,0.6); }
-    .btn-stop { background: #991b1b; border-color: var(--danger); font-size: 0.95rem; font-weight: 800; color: #fff; }
-    .btn-stop:active { background: var(--danger); }
-    .btn-disabled { opacity: 0.25; pointer-events: none; }
-    .speed-slider { width: 100%; max-width: 420px; background: var(--card-bg); border: 1px solid var(--border); border-radius: 12px; padding: 14px; margin-bottom: 18px; }
-    .slider-header { display: flex; justify-content: space-between; font-size: 0.8rem; font-weight: 600; color: #94a3b8; margin-bottom: 8px; }
-    input[type=range] { width: 100%; accent-color: var(--primary); cursor: pointer; }
-    .app-link { margin-top: auto; font-size: 0.8rem; color: #64748b; text-align: center; }
+    .telemetry { display: flex; gap: 8px; width: 100%; max-width: 420px; margin-bottom: 18px; }
+    .card { flex: 1; background: var(--card-bg); border: 1px solid var(--border); padding: 12px 6px; border-radius: 12px; text-align: center; }
+    .card-label { font-size: 0.68rem; color: #94a3b8; font-weight: 600; text-transform: uppercase; }
+    .val { font-size: 1.4rem; font-weight: 800; color: var(--primary); margin-top: 4px; }
+    .val.danger { color: var(--danger); }
+    .grid { display: grid; grid-template-columns: repeat(3, 85px); grid-template-rows: repeat(3, 85px); gap: 14px; justify-content: center; margin-bottom: 16px; }
+    .btn { background: #1e293b; border: 1px solid #334155; border-radius: 18px; color: white; font-size: 1.8rem; display: flex; align-items: center; justify-content: center; cursor: pointer; touch-action: none; -webkit-tap-highlight-color: transparent; }
+    .btn:active, .btn.pressed { background: var(--primary); color: #000; }
+    .btn-stop { background: #991b1b; border-color: var(--danger); font-size: 0.95rem; font-weight: 800; }
+    .btn-disabled { opacity: 0.3 !important; pointer-events: none !important; }
+    .action-bar { width: 100%; max-width: 420px; display: flex; gap: 12px; justify-content: center; }
+    .btn-arm { flex: 1; background: #065f46; border: 1px solid var(--success); color: white; border-radius: 12px; padding: 14px; font-weight: 800; font-size: 1rem; cursor: pointer; touch-action: manipulation; -webkit-tap-highlight-color: transparent; }
+    .btn-arm:active { background: var(--success); color: #000; }
   </style>
 </head>
 <body>
   <div class="header">
-    <div class="title"><div class="badge-dot" id="onlineDot"></div>ROVER COCKPIT</div>
-    <div style="font-size:0.75rem; color:#64748b;">ESP32 v2.0</div>
+    <div class="title">ROVER COCKPIT</div>
+    <div id="netInfo" style="font-size:0.75rem; color:#64748b; margin-top:4px; letter-spacing:0.5px;">CONNECTING...</div>
   </div>
-
   <div id="status" class="status-bar active">SYSTEM ARMED &bull; READY</div>
-
   <div class="telemetry">
-    <div class="card">
-      <div class="card-label">Front Sonar</div>
-      <div id="fDist" class="val">-- cm</div>
-    </div>
-    <div class="card">
-      <div class="card-label">Left Sonar</div>
-      <div id="lDist" class="val">-- cm</div>
-    </div>
+    <div class="card"><div class="card-label">Front Sonar</div><div id="fDist" class="val">-- cm</div></div>
+    <div class="card"><div class="card-label">Alcohol Sensor</div><div id="alcVal" class="val">--</div></div>
+    <div class="card"><div class="card-label">Left Sonar</div><div id="lDist" class="val">-- cm</div></div>
   </div>
-
-  <div class="speed-slider">
-    <div class="slider-header">
-      <span>THROTTLE PWM</span>
-      <span id="speedVal" style="color:var(--primary);">180</span>
-    </div>
-    <input type="range" min="100" max="255" value="180" id="spdInput" onchange="updateSpeed(this.value)">
-  </div>
-
-  <div class="grid" id="dpad">
+  <div class="grid">
     <div></div>
-    <button class="btn" id="btnF" onpointerdown="startDrive(event, 'F')" onpointerup="stopDrive(event)">&#9650;</button>
+    <button class="btn" id="btnF">&#9650;</button>
     <div></div>
-    <button class="btn" id="btnL" onpointerdown="startDrive(event, 'L')" onpointerup="stopDrive(event)">&#9664;</button>
-    <button class="btn btn-stop" onclick="resetPower(event)">STOP</button>
-    <button class="btn" id="btnR" onpointerdown="startDrive(event, 'R')" onpointerup="stopDrive(event)">&#9654;</button>
+    <button class="btn" id="btnL">&#9664;</button>
+    <button class="btn btn-stop" id="btnStop">STOP</button>
+    <button class="btn" id="btnR">&#9654;</button>
     <div></div>
-    <button class="btn" id="btnB" onpointerdown="startDrive(event, 'B')" onpointerup="stopDrive(event)">&#9660;</button>
+    <button class="btn" id="btnB">&#9660;</button>
     <div></div>
   </div>
-
-  <div class="app-link">Expo Mobile App Companion Mode Supported</div>
-
+  <div class="action-bar">
+    <button class="btn-arm" id="armBtn" onclick="manualArm()">RESTORE / RE-ARM</button>
+  </div>
   <script>
-    let activeCmd = 'S';
-    let heartbeatTimer = null;
-    let isHalted = false;
-    let currentPwm = 180;
-
-    function sendCmd(val) {
-      fetch('/cmd?val=' + val + '&spd=' + currentPwm, { cache: 'no-store' }).catch(() => {});
+    let activeCmd = 'S', hb = null, isBlocked = false, armCooldownUntil = 0;
+    
+    let fetchCtrl = new AbortController();
+    async function sendRaw(val) {
+      fetchCtrl.abort();
+      fetchCtrl = new AbortController();
+      try {
+        await fetch('/cmd?val=' + val, { cache: 'no-store', signal: fetchCtrl.signal });
+      } catch(e) {}
     }
-
-    function updateSpeed(v) {
-      currentPwm = parseInt(v);
-      document.getElementById('speedVal').innerText = currentPwm;
-      fetch('/settings?speed=' + currentPwm).catch(() => {});
-    }
-
-    function startDrive(e, dir) {
-      if (isHalted) return;
-      if (e) {
-        e.preventDefault();
-        try { e.target.setPointerCapture(e.pointerId); } catch(err) {}
-        e.target.classList.add('pressed');
-      }
+    
+    function startDrive(dir) {
+      if (isBlocked) return;
       activeCmd = dir;
-      sendCmd(dir);
-      if (heartbeatTimer) clearInterval(heartbeatTimer);
-      heartbeatTimer = setInterval(() => { if (activeCmd !== 'S') sendCmd(activeCmd); }, 160);
+      sendRaw(dir);
+      if (hb) clearInterval(hb);
+      hb = setInterval(() => {
+        if (activeCmd !== 'S' && !isBlocked) sendRaw(activeCmd);
+      }, 140);
     }
-
-    function stopDrive(e) {
-      if (e) {
-        e.preventDefault();
-        try { e.target.releasePointerCapture(e.pointerId); } catch(err) {}
-        e.target.classList.remove('pressed');
-      }
-      if (heartbeatTimer) { clearInterval(heartbeatTimer); heartbeatTimer = null; }
-      if (!isHalted) {
-        activeCmd = 'S';
-        sendCmd('S');
-      }
-    }
-
-    function resetPower(e) {
-      if (e) e.preventDefault();
-      if (heartbeatTimer) { clearInterval(heartbeatTimer); heartbeatTimer = null; }
+    
+    function stopDrive() {
+      if (hb) { clearInterval(hb); hb = null; }
       activeCmd = 'S';
-      sendCmd('S');
+      sendRaw('S');
     }
 
-    // Keyboard bindings for testing
-    let activeKey = null;
-    window.addEventListener('keydown', e => {
-      if (activeKey === e.key) return;
-      activeKey = e.key;
-      if (e.key === 'ArrowUp' || e.key === 'w') startDrive(null, 'F');
-      else if (e.key === 'ArrowDown' || e.key === 's') startDrive(null, 'B');
-      else if (e.key === 'ArrowLeft' || e.key === 'a') startDrive(null, 'L');
-      else if (e.key === 'ArrowRight' || e.key === 'd') startDrive(null, 'R');
-      else if (e.key === ' ') resetPower(null);
+    function bindDirBtn(id, cmd) {
+      const el = document.getElementById(id);
+      const start = (e) => { e.preventDefault(); startDrive(cmd); };
+      const stop = (e) => { e.preventDefault(); stopDrive(); };
+      el.addEventListener('pointerdown', start, { passive: false });
+      el.addEventListener('pointerup', stop, { passive: false });
+      el.addEventListener('pointercancel', stop, { passive: false });
+      el.addEventListener('contextmenu', e => e.preventDefault());
+    }
+
+    bindDirBtn('btnF', 'F');
+    bindDirBtn('btnB', 'B');
+    bindDirBtn('btnL', 'L');
+    bindDirBtn('btnR', 'R');
+
+    document.getElementById('btnStop').addEventListener('click', (e) => {
+      e.preventDefault();
+      stopDrive();
     });
 
-    window.addEventListener('keyup', e => {
-      activeKey = null;
-      if (e.key !== ' ') stopDrive(null);
-    });
+    async function manualArm() {
+      armCooldownUntil = Date.now() + 2500;
+      isBlocked = false;
+      
+      const s = document.getElementById('status');
+      s.className = 'status-bar active';
+      s.innerText = 'SYSTEM ARMED &bull; READY';
+      
+      document.querySelectorAll('.grid .btn').forEach(b => b.classList.remove('btn-disabled'));
+      await sendRaw('ARM'); 
+    }
 
-    // Telemetry polling
     setInterval(() => {
-      fetch('/status', { cache: 'no-store' })
-        .then(r => r.json())
-        .then(d => {
-          const fElem = document.getElementById('fDist');
-          const lElem = document.getElementById('lDist');
-          fElem.innerText = d.front + ' cm';
-          lElem.innerText = d.left + ' cm';
+      fetch('/status', { cache: 'no-store' }).then(r => r.json()).then(d => {
+        if (d.ip) {
+          const netEl = document.getElementById('netInfo');
+          if (netEl) netEl.innerText = (d.wifiMode || 'STA') + ' \u2022 ' + d.ip + ' \u2022 http://esp32-rover.local';
+        }
+        document.getElementById('fDist').innerText = d.front + ' cm';
+        document.getElementById('lDist').innerText = d.left + ' cm';
+        
+        const alcElem = document.getElementById('alcVal');
+        alcElem.innerText = d.alcohol;
+        
+        const s = document.getElementById('status');
+        const armBtn = document.getElementById('armBtn');
 
-          fElem.className = 'val ' + (d.front < 20 ? 'close' : '');
-          lElem.className = 'val ' + (d.left < 20 ? 'close' : '');
-
-          const s = document.getElementById('status');
-          if (d.state === 'HALTED') {
-            isHalted = true;
+        if (d.alcoholDetected) {
+          isBlocked = true;
+          alcElem.className = 'val danger';
+          s.className = 'status-bar alert';
+          s.innerText = 'ALCOHOL DETECTED: IGNITION LOCKED';
+          document.querySelectorAll('.grid .btn:not(.btn-stop)').forEach(b => b.classList.add('btn-disabled'));
+          armBtn.classList.add('btn-disabled');
+        } else if (d.state === 'PARKING') {
+          isBlocked = true;
+          alcElem.className = 'val';
+          s.className = 'status-bar warn';
+          s.innerText = 'MICROSLEEP: AUTO-PARKING TO LEFT CURB...';
+          document.querySelectorAll('.grid .btn:not(.btn-stop)').forEach(b => b.classList.add('btn-disabled'));
+          armBtn.classList.add('btn-disabled');
+        } else if (d.state === 'HALTED') {
+          if (Date.now() > armCooldownUntil) {
+            isBlocked = true;
+            alcElem.className = 'val';
             s.className = 'status-bar alert';
-            s.innerText = 'MICROSLEEP DETECTED: TYRES DISCONNECTED (TAP STOP TO RE-ARM)';
-            document.querySelectorAll('.btn:not(.btn-stop)').forEach(b => b.classList.add('btn-disabled'));
-          } else {
-            isHalted = false;
-            s.className = 'status-bar active';
-            s.innerText = d.state === 'MANUAL' ? 'MANUAL DRIVE ACTIVE' : 'POWER ARMED &bull; READY';
-            document.querySelectorAll('.btn').forEach(b => b.classList.remove('btn-disabled'));
+            s.innerText = 'PARKED & LOCKED: CLICK RESTORE/RE-ARM';
+            document.querySelectorAll('.grid .btn:not(.btn-stop)').forEach(b => b.classList.add('btn-disabled'));
+            armBtn.classList.remove('btn-disabled');
           }
-        }).catch(() => {});
+        } else {
+          isBlocked = false;
+          alcElem.className = 'val';
+          s.className = 'status-bar active';
+          s.innerText = d.state === 'MANUAL' ? 'MANUAL DRIVE' : 'ARMED &bull; READY';
+          document.querySelectorAll('.grid .btn').forEach(b => b.classList.remove('btn-disabled'));
+          armBtn.classList.remove('btn-disabled');
+        }
+      }).catch(() => {});
     }, 250);
   </script>
 </body>
 </html>
 )rawliteral";
 
-void handleRoot() {
-  server.send_P(200, "text/html", INDEX_HTML);
-}
+void handleRoot() { server.send_P(200, "text/html", INDEX_HTML); }
 
-// ======================== ARDUINO SETUP ===================================
+// ======================== SETUP & LOOP ===================================
 void setup() {
   Serial.begin(115200);
+  delay(200);
 
-  // Initialize motor bridge pins LOW
-  digitalWrite(L_RPWM, LOW);
-  digitalWrite(L_LPWM, LOW);
-  digitalWrite(L_REN, LOW);
-  digitalWrite(L_LEN, LOW);
-  digitalWrite(R_RPWM, LOW);
-  digitalWrite(R_LPWM, LOW);
-  digitalWrite(R_REN, LOW);
-  digitalWrite(R_LEN, LOW);
+  Serial.println("\n==================================================");
+  Serial.println("   ESP32 Autonomous Safety Rover Firmware Init   ");
+  Serial.println("==================================================");
 
-  pinMode(L_REN, OUTPUT);
-  pinMode(L_LEN, OUTPUT);
-  pinMode(R_REN, OUTPUT);
-  pinMode(R_LEN, OUTPUT);
+  pinMode(L_REN, OUTPUT); pinMode(L_LEN, OUTPUT);
+  pinMode(R_REN, OUTPUT); pinMode(R_LEN, OUTPUT);
 
-  // Ultrasonic sensor pins
-  pinMode(TRIG_FRONT, OUTPUT);
-  pinMode(ECHO_FRONT, INPUT);
-  pinMode(TRIG_LEFT, OUTPUT);
-  pinMode(ECHO_LEFT, INPUT);
+  digitalWrite(L_REN, LOW); digitalWrite(L_LEN, LOW);
+  digitalWrite(R_REN, LOW); digitalWrite(R_LEN, LOW);
 
-  // Initialize PWM channels
   initPwmPin(L_RPWM, L_RPWM_CH);
   initPwmPin(L_LPWM, L_LPWM_CH);
   initPwmPin(R_RPWM, R_RPWM_CH);
   initPwmPin(R_LPWM, R_LPWM_CH);
 
-  // Ensure motors start completely isolated
+  // Initialize Primary Strip (20 LEDs on Pin 5)
+  leds.begin();
+  leds.setBrightness(LED_BRIGHTNESS);
+
+  // Initialize Accent Strip (8 LEDs on Pin 14)
+  leds2.begin();
+  leds2.setBrightness(LED_BRIGHTNESS);
+  leds2.clear();
+  leds2.show();
+
   disconnectTyres();
 
-  // Configure WiFi Access Point
-  WiFi.mode(WIFI_AP);
-  WiFi.softAP(ssid, password);
-  WiFi.setSleep(false); // Disable WiFi power saving for ultra-low latency
+  performAlcoholPreCheck();
+
+  // ======================== COMMON WI-FI NETWORK INITIALIZATION =============
+  WiFi.mode(WIFI_STA); 
+  WiFi.setAutoReconnect(true);
+  WiFi.persistent(true);
+  WiFi.begin(ssid, password);
+  WiFi.setSleep(false);
   WiFi.setTxPower(WIFI_POWER_19_5dBm);
 
-  Serial.println("\n=======================================================");
-  Serial.println("  ESP32 Autonomous & Manual Safety Rover Online");
-  Serial.println("=======================================================");
-  Serial.print("  [WIFI] Hotspot SSID:  "); Serial.println(ssid);
-  Serial.print("  [WIFI] Hotspot IP:    http://"); Serial.println(WiFi.softAPIP());
-  Serial.println("=======================================================");
+  Serial.println("\n--------------------------------------------------");
+  Serial.print("[WIFI] Connecting to common network SSID: ");
+  Serial.println(ssid);
 
-  // Setup Web Server Routes
+  int attempts = 0;
+  while (WiFi.status() != WL_CONNECTED && attempts < 25) {
+    delay(400);
+    Serial.print(".");
+    attempts++;
+  }
+
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("\n[WIFI] Connected to Common Wi-Fi successfully!");
+    Serial.print("[WIFI] Rover IP Address : http://");
+    Serial.println(WiFi.localIP()); 
+    Serial.print("[WIFI] Gateway          : ");
+    Serial.println(WiFi.gatewayIP());
+    Serial.print("[WIFI] Signal Strength  : ");
+    Serial.print(WiFi.RSSI());
+    Serial.println(" dBm");
+
+    if (MDNS.begin("esp32-rover")) {
+      MDNS.addService("http", "tcp", 80);
+      Serial.println("[mDNS] Responder active at: http://esp32-rover.local");
+    } else {
+      Serial.println("[mDNS] Error setting up mDNS responder");
+    }
+  } else {
+    Serial.println("\n[WIFI] Warning: Could not connect to Station network!");
+    Serial.println("[WIFI] Launching Fallback SoftAP to prevent system lockout...");
+    WiFi.mode(WIFI_AP_STA);
+    WiFi.softAP("ESP32-Safety-Car", "12345678");
+    Serial.print("[WIFI] Emergency AP Active: SSID 'ESP32-Safety-Car' | IP: http://");
+    Serial.println(WiFi.softAPIP());
+    if (MDNS.begin("esp32-rover")) {
+      MDNS.addService("http", "tcp", 80);
+    }
+  }
+
+  udpServer.begin(UDP_PORT);
+  Serial.print("[UDP] Auto-discovery listener active on port ");
+  Serial.println(UDP_PORT);
+  Serial.println("--------------------------------------------------\n"); 
+
   server.on("/", HTTP_GET, handleRoot);
   server.on("/cmd", HTTP_GET, handleCommand);
+  server.on("/cmd", HTTP_POST, handleCommand);
   server.on("/cmd", HTTP_OPTIONS, handleOptions);
   server.on("/drive", HTTP_GET, handleDrive);
+  server.on("/drive", HTTP_POST, handleDrive);
   server.on("/drive", HTTP_OPTIONS, handleOptions);
   server.on("/status", HTTP_GET, handleStatus);
   server.on("/status", HTTP_OPTIONS, handleOptions);
   server.on("/settings", HTTP_GET, handleSettings);
+  server.on("/settings", HTTP_POST, handleSettings);
   server.on("/settings", HTTP_OPTIONS, handleOptions);
   server.on("/ping", HTTP_GET, handlePing);
   server.on("/ping", HTTP_OPTIONS, handleOptions);
@@ -650,62 +890,142 @@ void setup() {
   server.begin();
 }
 
-// ======================== MAIN CONTROL LOOP ==============================
 void loop() {
   server.handleClient();
+  updateLEDs();
 
   unsigned long currentMillis = millis();
 
-  // 1. Acceleration Ramp Engine (Runs every 15ms)
+  // 1. Live Alcohol Polling - Noise Filtered
+  if (currentMillis - lastAlcoholTick > 100) {
+    lastAlcoholTick = currentMillis;
+    
+    int rawAlc = analogRead(MQ3_PIN);
+    
+    if (currentMillis < ignoreAlcoholUntil) {
+        currentAlcoholVal = 0; 
+        alcoholStrikeCount = 0;
+    } else {
+        currentAlcoholVal = (currentAlcoholVal * 2 + rawAlc) / 3;
+        
+        if (rawAlc >= ALCOHOL_THRESH) {
+            alcoholStrikeCount++;
+        } else {
+            alcoholStrikeCount = 0;
+        }
+    }
+
+    if (alcoholStrikeCount >= 4) {
+      if (!alcoholLock) {
+        alcoholLock = true;
+        disconnectTyres();
+        Serial.print(">>> [ALARM] Sustained Alcohol Detected! ADC: ");
+        Serial.println(currentAlcoholVal);
+      }
+    } 
+    else if (alcoholStrikeCount == 0 && alcoholLock) {
+      alcoholLock = false;
+      disconnectTyres();
+      if (currentState != STATE_PARKING) {
+        currentState = STATE_IDLE;
+      }
+      Serial.println(">>> [OK] Air Cleared. System Auto-Restored.");
+    }
+  }
+
+  // 2. Serial Diagnostics Monitor
+  if (currentMillis - lastSerialDebug > 500) {
+    lastSerialDebug = currentMillis;
+    Serial.print("[MQ-3] ADC: ");
+    Serial.print(currentAlcoholVal);
+    Serial.print(" / ");
+    Serial.print(ALCOHOL_THRESH);
+    Serial.print(" | Lock: ");
+    Serial.print(alcoholLock ? "LOCKED" : "CLEAR");
+    Serial.print(" | State: ");
+    if (currentState == STATE_IDLE) Serial.println("IDLE");
+    else if (currentState == STATE_MANUAL) Serial.println("MANUAL");
+    else if (currentState == STATE_PARKING) Serial.println("PARKING");
+    else Serial.println("HALTED");
+  }
+
+  // 3. 3-Phase Perfect Auto-Parking Execution Engine (Left Arc into Curb)
+  if (currentState == STATE_PARKING) {
+    unsigned long elapsed = currentMillis - parkStartMs;
+
+    if (frontDist <= obstacleBrakeDist || leftDist <= PARK_CURB_CM) {
+      finishAutoPark();
+    }
+    else if (elapsed < PARK_PHASE1_MS) {
+      targetLeft   = -PARK_SPEED;
+      targetRight  = -PARK_SPEED / 4;
+    }
+    else if (elapsed < (PARK_PHASE1_MS + PARK_PHASE2_MS)) {
+      targetLeft   = -PARK_SPEED * 0.6;
+      targetRight  = -PARK_SPEED * 0.6;
+    }
+    else if (elapsed < (PARK_PHASE1_MS + PARK_PHASE2_MS + PARK_PHASE3_MS)) {
+      targetLeft   = 0;
+      targetRight  = 0;
+    }
+    else {
+      finishAutoPark();
+    }
+  }
+
+  // 4. Motor Acceleration Ramp 
   if (currentMillis - lastRampTick > 15) {
     lastRampTick = currentMillis;
-    if (currentState == STATE_HALTED) {
+    if (alcoholLock || currentState == STATE_HALTED) {
       disconnectTyres();
     } else {
       updateMotorRamp();
     }
   }
 
-  // 2. Safety Watchdog for Manual Driving (Auto-stops if phone goes out of range)
+  // 5. Watchdog for Manual Drive Mode
   if (currentState == STATE_MANUAL && (currentMillis - lastHeartbeat > watchdogMs)) {
     targetLeft   = 0;
     targetRight  = 0;
     currentState = STATE_IDLE;
   }
 
-  // 3. Sensor Routine (Every 80ms, alternating between front and left)
+  // 6. Companion App Serial Reader 
   if (currentMillis - lastSensorTick > 80) {
     lastSensorTick = currentMillis;
 
-    if (alternateSensor) {
-      frontDist = readDistanceNonBlock(TRIG_FRONT, ECHO_FRONT);
-      // Auto-brake check while driving forward
-      if (autoBrakeEnabled && frontDist < obstacleBrakeDist && currentState == STATE_MANUAL) {
-        if (targetLeft > 0 || targetRight > 0) {
-          targetLeft   = 0;
-          targetRight  = 0;
-          currentState = STATE_IDLE;
-          Serial.println("[AUTO-BRAKE] Front obstacle detected -> Stopped!");
-        }
-      }
-    } else {
-      leftDist = readDistanceNonBlock(TRIG_LEFT, ECHO_LEFT);
-    }
-    alternateSensor = !alternateSensor;
-
-    // External Serial trigger fallback (for companion Raspberry Pi / PC microsleep detection)
     if (Serial.available() > 0) {
       String msg = Serial.readStringUntil('\n');
       msg.trim();
+      msg.toUpperCase();
       if (msg == "STOP" || msg == "SLEEP" || msg == "PARK") {
-        disconnectTyres();
-        currentState = STATE_HALTED;
-        Serial.println("[SERIAL] Microsleep signal received -> Tyres disconnected.");
-      } else if (msg == "S") {
-        disconnectTyres();
-        currentState = STATE_IDLE;
-        Serial.println("[SERIAL] Reset received -> Power re-armed.");
+        startAutoPark();
+      } else if (msg == "ARM" || msg == "RESET" || msg == "RESTORE" || 
+                 msg == "ENABLE" || msg == "RE-ENABLE" || msg == "REARM" || 
+                 msg == "RE-ARM" || msg == "START" || msg == "RESUME") {
+        if (!alcoholLock) {
+          ignoreAlcoholUntil = millis() + 2500;
+          currentState = STATE_IDLE;
+          armMotorsHardware();
+          lastHeartbeat = millis();
+          Serial.println("[ARMED]");
+        } 
       }
+    }
+  }
+
+  // 7. Process UDP Discovery Requests
+  int packetSize = udpServer.parsePacket();
+  if (packetSize) {
+    char packetBuffer[64];
+    int len = udpServer.read(packetBuffer, sizeof(packetBuffer) - 1);
+    if (len > 0) packetBuffer[len] = 0;
+    if (strstr(packetBuffer, "DISCOVER_ROVER")) {
+      IPAddress myIp = (WiFi.status() == WL_CONNECTED) ? WiFi.localIP() : WiFi.softAPIP();
+      String reply = "ROVER_HERE:http://" + myIp.toString();
+      udpServer.beginPacket(udpServer.remoteIP(), udpServer.remotePort());
+      udpServer.print(reply);
+      udpServer.endPacket();
     }
   }
 }
