@@ -25,7 +25,7 @@
 // --- Alcohol Sensor & Buzzer ---
 #define MQ3_PIN         34   
 #define BUZZER_PIN      4    
-#define ALCOHOL_THRESH  1400 
+#define ALCOHOL_THRESH  3000 
 
 // --- 3-Phase Auto-Park Trajectory Settings ---
 #define PARK_SPEED          135   
@@ -66,8 +66,8 @@ bool autoBrakeEnabled    = false;
 int obstacleBrakeDist    = 18;
 
 // ======================== COMMON WI-FI NETWORK CONFIG =====================
-const char *ssid        = "Asianet-WIFI";       
-const char *password    = "200C86E89280";       
+const char *ssid        = "X200 fe";       
+const char *password    = "josh1234";       
 
 WebServer server(80);
 WiFiUDP udpServer;
