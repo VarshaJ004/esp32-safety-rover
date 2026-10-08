@@ -18,7 +18,7 @@ When microsleep or severe fatigue is detected, it automatically transmits emerge
                  ┌──────────────┴──────────────┐
                  ▼                             ▼
        [ Wi-Fi HTTP Dispatch ]        [ USB Serial Dispatch ]
-      http://192.168.4.1/cmd?val=STOP         "STOP\n"
+ http://esp32-rover.local/cmd?val=STOP         "STOP\n"
                  │                             │
                  └──────────────┬──────────────┘
                                 ▼
@@ -46,21 +46,19 @@ pip install -r requirements.txt
 python drowsiness_detector.py
 ```
 
-### Dashboard Access
-Once running:
-- **Local Web HUD**: `http://127.0.0.1:8000`
-- **Dual Camera Video Stream**: `http://127.0.0.1:8000/video_feed`
-- **Telemetry WebSocket**: `ws://127.0.0.1:8000/ws`
-- **Telemetry REST API**: `http://127.0.0.1:8000/telemetry`
+### Dashboard Access Across Common Network
+Once launched, the terminal displays your Laptop's LAN IP:
+- **Local Laptop Browser**: `http://localhost:8000`
+- **Mobile Phone / LAN Browser**: `http://<laptop-ip>:8000` (e.g. `http://192.168.1.50:8000`)
+- **Dual Camera Video Stream**: `http://<laptop-ip>:8000/video_feed`
+- **Telemetry WebSocket**: `ws://<laptop-ip>:8000/ws`
+- **Telemetry REST API**: `http://<laptop-ip>:8000/telemetry`
 
 ---
 
-## ⚙️ Configuration Options
+## ⚙️ Configuration & Auto-Discovery
 
-Open `drowsiness_detector.py` to customize:
-- `ESP32_HOST_URL = "http://192.168.4.1"`: Wi-Fi gateway IP of the rover.
-- `DRIVER_CAM_INDEX = 0`: Camera index for driver webcam.
-- `ROAD_SOURCE = 1`: Camera index or video stream for road hazard detection.
-- `EYE_CLOSED_THRESHOLD = 0.42`: Sensitivity for detecting closed eyes.
-- `CRITICAL_CLOSURE_TIME = 2.0`: Seconds of eye closure before vehicle emergency stop triggers.
-- `WARN_CLOSURE_TIME = 1.0`: Seconds of eye closure before audio warning sounds.
+The DMS AI connects to the ESP32 rover on your common network:
+- **Target URL Default**: `http://esp32-rover.local` (or whatever is in `config.json`).
+- **LAN Auto-Discovery**: Automatically listens for or broadcasts UDP discovery packets on port 4210.
+- **Web UI URL Config**: Click the **ROVER** badge in the top bar of the DMS web dashboard to view or change the target Rover IP at any time without editing code.
